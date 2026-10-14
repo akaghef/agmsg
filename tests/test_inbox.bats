@@ -233,3 +233,23 @@ delivered_to_operator() {
   # The late message was not silently marked read by the first run
   [ "$(unread_count alice)" -eq 1 ]
 }
+
+@test "inbox: peek leaves unread; acknowledgement only consumes supplied recipient ids" {
+  bash "$SCRIPTS/send.sh" testteam bob alice "first" >/dev/null
+  local before
+  before=$(bash "$SCRIPTS/inbox.sh" testteam alice --peek-json)
+  [ -n "$before" ]
+  [ "$before" = "$(bash "$SCRIPTS/inbox.sh" testteam alice --peek-json)" ]
+  local id
+  id=$(printf '%s' "$before" | node -e 'let s="";process.stdin.on("data",x=>s+=x).on("end",()=>console.log(JSON.parse(s).id))')
+  bash "$SCRIPTS/send.sh" testteam bob alice "arrived later" >/dev/null
+  bash "$SCRIPTS/inbox.sh" testteam bob --ack "$id"
+  [[ "$(bash "$SCRIPTS/inbox.sh" testteam alice --peek-json)" == *first* ]]
+  bash "$SCRIPTS/inbox.sh" testteam alice --ack "$id"
+  local after
+  after=$(bash "$SCRIPTS/inbox.sh" testteam alice --peek-json)
+  [[ "$after" == *"arrived later"* ]]
+  [[ "$after" != *first* ]]
+  bash "$SCRIPTS/inbox.sh" testteam alice --ack "$id"
+  [ "$after" = "$(bash "$SCRIPTS/inbox.sh" testteam alice --peek-json)" ]
+}

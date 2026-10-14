@@ -433,7 +433,7 @@ class AppServerClient {
       if (!pending) return;
       this.pending.delete(message.id);
       if (message.error) {
-        pending.reject(new Error(message.error.message || JSON.stringify(message.error)));
+        pending.reject(Object.assign(new Error(message.error.message || JSON.stringify(message.error)), { rpcRejected: true, code: message.error.code }));
       } else {
         pending.resolve(message.result);
       }
@@ -775,7 +775,7 @@ class WebSocketAppServerClient {
       if (!pending) return;
       this.pending.delete(message.id);
       if (message.error) {
-        pending.reject(new Error(message.error.message || JSON.stringify(message.error)));
+        pending.reject(Object.assign(new Error(message.error.message || JSON.stringify(message.error)), { rpcRejected: true, code: message.error.code }));
       } else {
         pending.resolve(message.result);
       }
@@ -916,6 +916,8 @@ class CodexBridge {
     this.threadId = opts.threadId || null;
     this.threadIdle = true;
     this.turnActive = false;
+    this.activeTurnId = null;
+    this.deliveryPromise = null;
     this.turnTimer = null;
     this.pendingWake = false;
     this.watchHandle = null;
@@ -931,6 +933,7 @@ class CodexBridge {
       : crypto.createHash("sha1").update(identities.map((p) => `${p.team}\t${p.name}`).join("\n")).digest("hex");
     this.pidfile = path.join(RUN_DIR, `codex-bridge.${key}.pid`);
     this.metafile = path.join(RUN_DIR, `codex-bridge.${key}.meta`);
+    this.deliveryFile = path.join(RUN_DIR, `codex-bridge.${key}.delivery.json`);
   }
 
   async run() {
@@ -950,18 +953,9 @@ class CodexBridge {
     this.client.on("error", this.clientHandler("error", (params) => this.onServerError(params)));
     this.client.on("item/agentMessage/delta", this.clientHandler("item/agentMessage/delta", (params) => this.onAgentMessageDelta(params)));
     this.client.on("thread/status/changed", this.clientHandler("thread/status/changed", (params) => this.onThreadStatus(params)));
-    this.client.on("turn/started", this.clientHandler("turn/started", () => {
-      this.turnActive = true;
-      this.threadIdle = false;
-      // This turn was not started by tryStartTurn() -- e.g. a TUI-driven turn
-      // on a thread the bridge shares -- so nothing else will arm a watchdog
-      // for it. Without one, a turn that never reports completion (the app
-      // -server does not reliably send turn/completed, see #41) leaves
-      // turnActive stuck true and every later wake deferred forever. See #299.
-      this.startTurnWatchdog();
-    }));
+    this.client.on("turn/started", this.clientHandler("turn/started", (params) => this.onTurnStarted(params)));
     this.client.on("turn/completed", this.clientHandler("turn/completed", (params) => this.onTurnCompleted(params)));
-    this.client.on("turn/failed", this.clientHandler("turn/failed", () => this.onTurnCompleted()));
+    this.client.on("turn/failed", this.clientHandler("turn/failed", (params) => this.onTurnCompleted(params)));
 
     // A headless bridge must never leave a prompt only a human can answer
     // unanswered -- an unanswered approval/elicitation request wedges the
@@ -980,6 +974,7 @@ class CodexBridge {
     await this.client.ready?.();
     await this.initialize();
     await this.ensureThread();
+    if (this.opts.inlineInbox) this.recoverDelivery();
     await this.armWatch();
     // After armWatch, not before: the seat is a claim that this role is being
     // delivered to, and until the watch is armed that is not yet true.
@@ -1225,6 +1220,14 @@ class CodexBridge {
     this.watchRearmTimer = null;
   }
 
+  onTurnStarted(params) {
+    if (params.threadId !== this.threadId) return;
+    this.activeTurnId = params.turn && params.turn.id;
+    this.turnActive = true;
+    this.threadIdle = false;
+    this.startTurnWatchdog();
+  }
+
   onThreadStatus(params) {
     if (params.threadId !== this.threadId) return;
     const type = params.status && params.status.type;
@@ -1264,6 +1267,7 @@ class CodexBridge {
   async onTurnEnded() {
     this.clearTurnWatchdog();
     this.turnActive = false;
+    this.activeTurnId = null;
     this.threadIdle = true;
     if (this.opts.maxWakes && this.wakeCount >= this.opts.maxWakes) {
       await this.shutdown();
@@ -1286,16 +1290,12 @@ class CodexBridge {
   }
 
   async tryStartTurn() {
-    if (!this.pendingWake || this.turnActive || !this.threadIdle) return;
     if (this.opts.inlineInbox) {
-      this.inlineInboxText = this.readInboxForPrompt();
-      if (!this.inlineInboxText.trim()) {
-        console.error("codex-bridge: pending wake had no inbox output; re-arming");
-        this.pendingWake = false;
-        await this.armWatch();
-        return;
-      }
+      if (this.deliveryPromise) return this.deliveryPromise;
+      this.deliveryPromise = this.deliverInline().finally(() => { this.deliveryPromise = null; });
+      return this.deliveryPromise;
     }
+    if (!this.pendingWake || this.turnActive || !this.threadIdle) return;
     const prompt = this.buildPrompt();
     this.turnActive = true;
     this.threadIdle = false;
@@ -1411,26 +1411,108 @@ class CodexBridge {
     ].join("\n");
   }
 
-  readInboxForPrompt() {
-    // Re-resolve locks immediately before reading. watch-once only tells us
-    // that *some* eligible identity woke; ownership can change before this
-    // turn starts, so never let a stale bridge membership mark another
-    // session's messages read.
-    const eligible = spawnSync(BASH_BIN, [path.join(SCRIPT_DIR, "eligible-pairs.sh"), toPosixPath(this.opts.project), this.opts.type,
+  eligiblePairs() {
+    const result = spawnSync(BASH_BIN, [path.join(SCRIPT_DIR, "eligible-pairs.sh"), toPosixPath(this.opts.project), this.opts.type,
       ...this.identities.flatMap((pair) => ["--pair", `${pair.team}\t${pair.name}`])], { cwd: this.opts.project, encoding: "utf8" });
-    if (eligible.error || eligible.status !== 0) {
-      console.error("codex-bridge: could not resolve eligible identities before reading inbox");
-      return "";
-    }
-    const allowed = new Set((eligible.stdout || "").split(/\r?\n/).filter(Boolean));
-    const sections = [];
+    if (result.error || result.status !== 0) throw new Error("cannot validate delivery identities");
+    return new Set((result.stdout || "").split(/\r?\n/).filter(Boolean));
+  }
+
+  peekInbox() {
+    const allowed = this.eligiblePairs();
+    const batches = [];
     for (const pair of this.identities) {
       if (!allowed.has(`${pair.team}\t${pair.name}`)) continue;
-      const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, "inbox.sh"), pair.team, pair.name], { cwd: this.opts.project, encoding: "utf8" });
-      if (result.error || result.status !== 0) { console.error(`codex-bridge: inbox.sh failed for ${pair.team}/${pair.name}`); continue; }
-      if ((result.stdout || "").trim()) sections.push(result.stdout.trim());
+      const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, "inbox.sh"), pair.team, pair.name, "--peek-json"],
+        { cwd: this.opts.project, encoding: "utf8" });
+      if (result.error || result.status !== 0) throw new Error("cannot peek inbox");
+      const rows = (result.stdout || "").split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+      if (rows.length) batches.push({ ...pair, rows });
     }
-    return sections.join("\n\n");
+    return batches;
+  }
+
+  saveDelivery(record) {
+    const temp = `${this.deliveryFile}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(record) + "\n", { mode: 0o600 });
+    fs.renameSync(temp, this.deliveryFile);
+  }
+
+  acknowledgeDelivery(record) {
+    const allowed = this.eligiblePairs();
+    if (record.threadId !== this.threadId) throw new Error("pending delivery belongs to a different thread");
+    for (const batch of record.batches) {
+      if (!this.identities.some((p) => p.team === batch.team && p.name === batch.name) ||
+          !allowed.has(`${batch.team}\t${batch.name}`)) throw new Error("pending delivery role is no longer eligible");
+      const result = spawnSync(BASH_BIN, [path.join(SCRIPTS_DIR, "inbox.sh"), batch.team, batch.name, "--ack", ...batch.ids],
+        { cwd: this.opts.project, encoding: "utf8" });
+      if (result.error || result.status !== 0) throw new Error("delivery accepted; acknowledgement pending");
+    }
+    fs.unlinkSync(this.deliveryFile);
+  }
+
+  recoverDelivery() {
+    if (!fs.existsSync(this.deliveryFile)) return;
+    const record = JSON.parse(fs.readFileSync(this.deliveryFile, "utf8"));
+    if (record.state !== "accepted") throw new Error("delivery outcome uncertain; retained unread, refusing duplicate replay");
+    this.acknowledgeDelivery(record);
+  }
+
+  async resolveActiveTurn() {
+    if (!this.activeTurnId) {
+      const response = await this.client.request("thread/turns/list", {
+        threadId: this.threadId, limit: 1, sortDirection: "desc", itemsView: "summary",
+      });
+      const turn = response.data && response.data[0];
+      if (turn && turn.status === "inProgress") this.activeTurnId = turn.id;
+    }
+    if (!this.activeTurnId) throw new Error("active turn ID unavailable; inbox remains unread");
+    return this.activeTurnId;
+  }
+
+  async deliverInline() {
+    if (!this.pendingWake || this.stopping) return;
+    this.recoverDelivery();
+    const batches = this.peekInbox();
+    if (!batches.length) {
+      this.pendingWake = false;
+      await this.armWatch();
+      return;
+    }
+    const rows = batches.flatMap((b) => b.rows);
+    // Preserve the existing official inbox rendering so native observers see
+    // the same sender, body and transport timestamp for idle and active turns.
+    this.inlineInboxText = `${rows.length} new message(s):\n\n` + rows.map((row) =>
+      `  [${row.at}] ${row.from}: ${row.body.replace(/\n/g, "\\n").replace(/\t/g, "\\t")}`).join("\n");
+    const record = { state: "sending", threadId: this.threadId,
+      batches: batches.map((b) => ({ team: b.team, name: b.name, ids: b.rows.map((r) => String(r.id)) })) };
+    const active = this.turnActive || !this.threadIdle;
+    const params = { threadId: this.threadId, input: [{ type: "text", text: this.buildPrompt(), text_elements: [] }] };
+    if (active) params.expectedTurnId = await this.resolveActiveTurn();
+    else Object.assign(params, { cwd: this.opts.project, runtimeWorkspaceRoots: this.opts.workspaceRoots });
+    this.saveDelivery(record);
+    try {
+      const response = await this.client.request(active ? "turn/steer" : "turn/start", params);
+      if (active && response.turnId !== params.expectedTurnId) throw new Error("steer response turn mismatch; outcome uncertain");
+      record.state = "accepted";
+      this.saveDelivery(record);
+      this.acknowledgeDelivery(record);
+      this.pendingWake = false;
+      this.turnActive = true;
+      this.threadIdle = false;
+      this.activeTurnId = active ? response.turnId : (response.turn && response.turn.id) || this.activeTurnId;
+      this.startTurnWatchdog();
+      console.error(`codex-bridge: ${active ? "steered active" : "started"} turn on thread ${this.threadId}`);
+      // Continue observing even during this turn: a later DONE must not wait
+      // for an actively working parent to decide to yield.
+      await this.armWatch();
+    } catch (error) {
+      // A confirmed RPC rejection is safe to retry after re-reading state.
+      // Transport loss/timeout is ambiguous: leave the journal and unread rows,
+      // and stop rather than risk delivering the same input twice.
+      if (error.rpcRejected && record.state === "sending") fs.unlinkSync(this.deliveryFile);
+      throw error;
+    }
   }
 
   async shutdown() {
@@ -1641,4 +1723,4 @@ if (require.main === module) {
 // the property that matters — a diagnostic never continues someone else's
 // half-line — is a property of these two together, and driving them directly
 // is the only way to state it without standing up an app-server.
-module.exports = { toPosixPath, writeErr, logLine };
+module.exports = { toPosixPath, writeErr, logLine, CodexBridge };

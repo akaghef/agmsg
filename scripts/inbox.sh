@@ -7,6 +7,7 @@ set -euo pipefail
 
 TEAM="${1:?Usage: inbox.sh <team> <agent_id> [--quiet]}"
 AGENT="${2:?Missing agent_id}"
+MODE="${3:-}"
 QUIET=false
 if [ "${3:-}" = "--quiet" ]; then
   QUIET=true
@@ -15,6 +16,20 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 agmsg_storage_load
+
+# Delivery consumers peek first and acknowledge only after input acceptance.
+# The storage facade keeps acknowledgement recipient-scoped and idempotent.
+if [ "$MODE" = "--ack" ]; then
+  shift 3
+  [ "$#" -gt 0 ] || exit 0
+  storage_mark_read_batch "$TEAM" "$AGENT" "$@"
+  exit
+fi
+if [ "$MODE" = "--peek-json" ]; then
+  storage_store_exists "$TEAM" || exit 0
+  storage_list_unread "$TEAM" "$AGENT"
+  exit
+fi
 
 # An inbox check must not create the store, so a team that has never been
 # written to has no file yet. Since the stores split per team that is the
