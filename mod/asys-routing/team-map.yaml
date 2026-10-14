@@ -1,0 +1,9 @@
+version: 1
+rules:
+  - path: ~/dev/M3E
+    team: m3e
+  - path: ~/dev/Akaghef-System
+    team: a-sys
+  - path: ~/dev/Akaghef-System-worktrees
+    team: a-sys
+default: triage

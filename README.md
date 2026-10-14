@@ -1,5 +1,10 @@
 # agmsg
 
+A-sys managed fork: [source ownership and installation](doc/asys-management.md).
+Maintained branch: `codex/asys-canonical`; runtime baseline: upstream v1.2.2.
+Use `bash src/install.sh --apply` for the managed installation.
+
+
 *[日本語](README.ja.md)*
 
 [![CI](https://img.shields.io/github/actions/workflow/status/fujibee/agmsg/tests.yml?branch=main&label=CI&logo=github)](https://github.com/fujibee/agmsg/actions/workflows/tests.yml)

@@ -1,229 +1,212 @@
 ---
 name: agmsg
-description: Cross-agent messaging via SQLite. Send messages between Claude Code, Codex, Gemini CLI, GitHub Copilot CLI, and other agents. No daemon, no network, no dependencies beyond bash and sqlite3.
+description: Cross-agent messaging via SQLite. Send messages between Claude Code, Codex, Gemini CLI, and other agents. No daemon, no network, no dependencies beyond bash and sqlite3.
 ---
 
-# Agent Messaging
+Agent messaging command. **IMPORTANT: Always use the provided scripts. NEVER directly read or edit config files, DB, or team data. There is NO register.sh — use join.sh to join a team.**
 
-**IMPORTANT: Always use the provided scripts. NEVER directly read or edit config files, DB, or team data. There is NO register.sh — use join.sh to join a team.**
+**Shell requirement:** All agmsg scripts are Bash scripts. Always execute them via `bash`, never via PowerShell or cmd directly. If your default shell is not Bash (e.g. PowerShell on Windows), wrap every command with `bash -lc '...'`. Example: `bash -lc '~/.agents/skills/agmsg/scripts/send.sh myteam alice bob "hello"'`. Always single-quote the `bash -lc` payload; NEVER use a double-quoted wrapper with escaped inner quotes (e.g. `bash -lc "... \"$PWD\" ..."`) — PowerShell parses `\"` as a literal backslash that terminates the string, silently corrupting the command and dropping everything after it. Do NOT construct DB paths manually — the scripts handle path resolution internally. If you need to redirect storage, use `AGMSG_STORAGE_PATH` (the supported override).
 
-**Shell requirement:** All agmsg scripts are Bash scripts. Always execute them via `bash`, never via PowerShell or cmd directly. If your default shell is not Bash (e.g. PowerShell on Windows), wrap every command with `bash -lc '...'`. Example: `bash -lc '~/.agents/skills/agmsg/scripts/send.sh myteam alice bob "hello"'`. Do NOT construct DB paths manually — the scripts handle path resolution internally. If you need to redirect storage, use `AGMSG_STORAGE_PATH` (the supported override).
+## DP Router
 
-## How to use
+DP0: consult the A-sys communication protocols and `doc/asys-management.md`.
+DP1: install from the A-sys-managed fork with `bash src/install.sh --apply`;
+team enrollment and delivery mode remain the existing agmsg procedures below.
+DP2: use the installed scripts below. Source changes belong in the managed
+fork; update it and reinstall rather than editing the runtime copy.
 
-### Step 0: First-run bootstrap
+## Identity
 
-agmsg keeps its SQLite database, team registry, and runtime state under `~/.agents/skills/agmsg/`. The `./install.sh` install path creates that tree; the Claude Code plugin install path does not (the plugin marketplace flow only drops the skill content into `~/.claude/plugins/cache/`). Before any other command, bootstrap if needed:
+If you already know your AGENT and TEAMS from a previous `$agmsg` call in this session, skip to **Execute** below.
 
-```bash
-if [ ! -d ~/.agents/skills/agmsg ]; then
-  # Locate the plugin install script (any version), run it once.
-  installer=$(ls ~/.claude/plugins/cache/fujibee-agmsg/agmsg/*/install.sh 2>/dev/null | head -1)
-  if [ -n "$installer" ]; then
-    bash "$installer" --cmd agmsg
-  else
-    echo "agmsg not installed. Either:" >&2
-    echo "  - run ./install.sh in the agmsg repo, or" >&2
-    echo "  - install via /plugin marketplace add fujibee/agmsg && /plugin install agmsg@fujibee-agmsg" >&2
-    exit 1
-  fi
-fi
-```
+Otherwise, run: `~/.agents/skills/agmsg/scripts/whoami.sh "$(pwd)" codex`
 
-After this runs once, `~/.agents/skills/agmsg/` is populated and you can skip Step 0 on future invocations.
+**Windows PowerShell:** The Shell requirement above still applies, but a bare `bash` in PowerShell often resolves to the WSL shim. Invoke **Git Bash** explicitly and keep the entire `-lc` payload inside one PowerShell single-quoted string:
 
-### Step 1: Check identity
+`& 'C:\Program Files\Git\bin\bash.exe' -lc '~/.agents/skills/agmsg/scripts/whoami.sh "$(pwd)" codex'`
 
-```bash
-~/.agents/skills/agmsg/scripts/whoami.sh "$(pwd)" <type>
-# type: claude-code, codex, gemini, antigravity, copilot
-# Returns: agent=... / multiple=true ... / suggest=true ... / not_joined=true ...
-```
+Do not use POSIX `'"'"'` quote splicing in PowerShell; it can leave the `-lc` payload unterminated. Windows PowerShell 5.1 strips the embedded double quotes when passing the payload, so `"$(pwd)"` arrives unquoted — fine unless the current directory contains spaces; prefer PowerShell 7.3+ if it does. If Git Bash is installed elsewhere, replace the executable path above with its actual path.
 
-### Step 2a: If not in a team — join one
+Four possible outputs:
 
-Before first-time setup, inspect the user's request. If they ask to join,
-import, or bring in a team that already exists on a server, do not run
-`join.sh`. Go directly to the `remote pull` command under Step 2b. Before
-pulling, run `team-list.sh --json --scope all`; if a same-named local team has
-`binding_state` `none` or `disconnected`, stop and ask the user how to proceed.
-After pull succeeds, return here so the user can register a new local agent in
-the team that pull just created.
+**A) Single identity:**
+`agent=<name> teams=<t1,t2,...> type=codex project=<path>`
+→ Remember AGENT and TEAMS, then go to **Execute**.
 
-Ask the user for a team name. If it's an existing team, run `team.sh <team>` first to see the current roster and note the names already in use. Look for a naming convention already in play (e.g. a shared base name with role and number suffixes (`<base>-<role><n>`), or names derived from the team name) and, when one exists, propose 2-3 unused names that extend it; otherwise propose 2-3 short, distinctive identity names (not a bare tool-type label like `codex`/`cc`). Either way, names must not collide with the roster. For a brand-new team, skip the roster check and just ask. Then run:
+**B) Multiple identities:**
+`multiple=true agents=<n1,n2,...> teams=<t1,t2,...> type=codex project=<path>`
+→ Ask the user which agent name to use for this session, then go to **Execute**.
 
-```bash
-~/.agents/skills/agmsg/scripts/join.sh <team> <agent_name> <type> "$(pwd)" [--force]
-```
+**C) Not in a team:**
+`not_joined=true available_teams=<t1,t2,...>` (or `available_teams=none`)
+→ Show the user the available teams from the output, then:
 
-Do NOT manually edit config files. Always use join.sh. If the name was recently renamed away with `rename.sh`, join.sh refuses to revive it (printing the new name it maps to) instead of silently re-registering it — this guards against a CLI slash-command history resubmitting `actas <old_name>` after a rename. Pass `--force` only for a deliberate, unrelated reuse of that exact name.
+  Before first-time setup, inspect the user's request. If they ask to join, import, or bring in a team that already exists on a server, do not call `join.sh`. Go directly to `remote pull` under Execute. First run `~/.agents/skills/agmsg/scripts/team-list.sh --json --scope all`; if a same-named local team has `binding_state` `none` or `disconnected`, stop and ask the user how to proceed. After pull succeeds, return to Identity setup so the user can register a new local agent in the pulled team.
 
-### Step 2b: If already in a team — execute command
+  > **First-time setup required.**
+  > Joining a team so this agent can send and receive messages.
+  > - **Team name**: a group of agents that can message each other (available: <list from output>)
+  > - **Agent name**: this agent's identity within the team
 
-**Default (no arguments): IMMEDIATELY check inbox. Do NOT ask what to do.**
+  1. Ask: "Enter a team name (joins existing or creates new)"
+  2. If the team name given already appears in `available_teams`, run `~/.agents/skills/agmsg/scripts/team.sh <team>` to see the current roster (name, type, project) and note the names already in use. Look for a naming convention already in play (e.g. a shared base name with role and number suffixes (`<base>-<role><n>`), or names derived from the team name) and, when one exists, propose 2-3 unused names that extend it; otherwise propose 2-3 short, distinctive identity names (not a bare tool-type label like `codex`/`cc`). Either way, names must not collide with the roster. Then ask: "Enter a name for this agent (suggestions: <name1>, <name2>, <name3> — or type your own)". For a brand-new team, skip the roster check and just ask: "Enter a name for this agent".
+  3. **You MUST use join.sh** — run: `~/.agents/skills/agmsg/scripts/join.sh <team> <agent_name> codex "$(pwd)"`
+  4. Show the result and explain:
 
-```bash
-# Check inbox (marks messages as read) — DEFAULT action
-~/.agents/skills/agmsg/scripts/inbox.sh <team> <agent_id>
+  > **Joined!** You can now use `$agmsg` to check and send messages.
+  > - `$agmsg` — check inbox
+  > - `$agmsg send <agent> <message>` — send a message
+  > - `$agmsg team` — list team members
+  > - `$agmsg history` — message history
 
-# Send a message (from/to must already be registered in <team>; add --force to bypass)
-~/.agents/skills/agmsg/scripts/send.sh <team> <from_agent> <to_agent> "<message>" [--force]
+  5. **REQUIRED — Do NOT skip this step.** Ask the user to pick a delivery mode using exactly this prompt:
 
-# Message history
-~/.agents/skills/agmsg/scripts/history.sh <team> [agent_id] [limit]
+     ```
+     Choose delivery mode for incoming messages:
 
-# Export a team's message history as JSONL — one message_sent record per line,
-# chronological. Default to stdout (pipeable); --out <file> writes a file.
-# --agent limits to one agent; --limit keeps the most recent N (omit = all
-# currently retained). Output is plaintext (the local store is plaintext).
-~/.agents/skills/agmsg/scripts/export.sh --team <team> [--agent <agent>] [--limit N] [--out <file>]
+       1) monitor — Real-time push
+                    Prints a `codex` shell function that routes launches through an
+                    app-server bridge, so it changes how `codex` starts.
+                    See docs/codex-monitor-beta.md.
+                    Recommended.
 
-# List team members
-~/.agents/skills/agmsg/scripts/team.sh <team>
+       2) turn    — Check inbox at the end of each assistant turn
+                    Stop hook pulls after each response.
 
-# List every locally known team (read-only, secret-free — "agmsg team list").
-# Distinct from `team.sh <team>` above: check for "team list" FIRST so
-# "list" is never mistaken for a team name. --json emits a strict,
-# versioned object ({schema_version, teams: [{name, remote_team_id, scope,
-# binding_state}]}) and exits non-zero with NO payload if any team was
-# unreadable or the count was truncated — never a partial list dressed up
-# as complete. See scripts/team-list.sh's own header comment for the exact
-# enums and why onboarding_state/promote_eligible/blocked_reason are
-# deliberately NOT in this schema yet (their meaning depends on ADR 0010,
-# which hasn't landed).
-~/.agents/skills/agmsg/scripts/team-list.sh [--json] [--scope all|project] [<project_path>]
+       3) off     — No automatic delivery
+                    Manual $agmsg only.
 
-# Leave a team
-~/.agents/skills/agmsg/scripts/leave.sh <team> <agent_id>
+     [1]:
+     ```
 
-# Rename a team (moves dir, updates config + messages).
-# After renaming, each existing member should re-run whoami.sh to refresh
-# their cached team name in any running session.
-~/.agents/skills/agmsg/scripts/rename-team.sh <old_team> <new_team>
+     - **Wait for the user's answer before proceeding.** Empty input means `1` (monitor).
+     - Map the chosen number to a mode (`1`→`monitor`, `2`→`turn`, `3`→`off`) and run:
+       `~/.agents/skills/agmsg/scripts/delivery.sh set <mode> codex "$(pwd)"`
+     - If monitor is chosen, tell the user: "Codex monitor changes how `codex` starts — it prints a shell function to add to your shell profile. Add the printed function, restart the shell, then launch future sessions with normal `codex`. If you prefer a global PATH shim, run `~/.agents/skills/agmsg/scripts/drivers/types/codex/codex-shim-install.sh install` and put `~/.agents/bin` first on PATH. You can also use `~/.agents/skills/agmsg/scripts/drivers/types/codex/codex-monitor.sh` for explicit monitor launches. The bridge starts on the **first turn** of a new Codex session (the SessionStart hook fires on your first message, not the moment Codex opens), so **restart your Codex session and send one message for monitor to take effect** — this already-running session stays unmonitored until it restarts. For more info: https://github.com/fujibee/agmsg/blob/main/docs/codex-monitor-beta.md"
 
-# Show the installed version — the git-describe provenance string recorded at
-# install time (tag + commits-since + abbreviated commit, plus -dirty when
-# installed from a tree with uncommitted changes). See #117.
-~/.agents/skills/agmsg/scripts/version.sh
+  6. Then check inbox for the newly joined team.
 
-# Clear registrations for the current project/type.
-# A trailing <session_id> additionally releases any actas exclusivity locks
-# this session held on <agent_id> so peers can pick them up immediately.
-~/.agents/skills/agmsg/scripts/reset.sh "$(pwd)" <type> [agent_id] [session_id]
+**D) Suggestions for reuse:**
+`suggest=true agents=<n1,n2,...> teams=<t1,t2,...> type=codex project=<path> available_teams=<t1,t2,...>`
+→ No exact registration exists for this project, but there are same-type agent names registered elsewhere.
 
-# Set delivery mode for this project.
-#   monitor — real-time push via SessionStart + Monitor tool (claude-code only)
-#   turn    — Stop-hook pulls at the end of each assistant turn
-#   both    — monitor primary, turn as fallback
-#   off     — no automatic delivery
-~/.agents/skills/agmsg/scripts/delivery.sh set <mode> <type> "$(pwd)"
-~/.agents/skills/agmsg/scripts/delivery.sh status <type> "$(pwd)"
+  1. Show the suggested agent names to the user.
+  2. Ask whether to reuse one of those names or choose a new one.
+  3. Ask for the team name to join (existing or new).
+  4. Run: `~/.agents/skills/agmsg/scripts/join.sh <team> <agent_name> codex "$(pwd)"`
+  5. Then continue with the normal post-join flow above.
 
-# Multiple roles per project (one CC = one active role).
-# Claude Code: `actas` claims an exclusivity lock for <name> across sessions
-# and restarts the Monitor filtered to <name> only; peer watchers stop
-# subscribing to <name> while this session holds the lock. `drop` releases.
-# Codex: actas is send-side only (no stable session_id during slash commands
-# → no peer-visible lock). See README "Codex caveat" for details.
-# If <name> is new and none was given upfront (bare `actas`, or the user asks
-# for a suggestion), check the target team's roster first (team.sh <team>).
-# Look for a naming convention already in play (e.g. a shared base name with
-# role and number suffixes (<base>-<role><n>), or names derived from the
-# team name) and, when one exists, propose 2-3 unused names that extend it;
-# otherwise propose 2-3 short, distinctive names. Either way, names must not
-# collide with the roster. Ask the user to pick before continuing.
-~/.agents/skills/agmsg/scripts/actas-claim.sh "$(pwd)" <type> <name> "$session_id"
-~/.agents/skills/agmsg/scripts/reset.sh "$(pwd)" <type> <name> "$session_id"
+## Execute
 
-# (Both of the above are normally driven by `/agmsg actas <name>` and
-#  `/agmsg drop <name>` slash commands, which also handle the Monitor
-#  TaskStop + relaunch dance described in the cmd template.)
+**Only use scripts in `~/.agents/skills/agmsg/scripts/` — do not read or modify files under `teams/` or `db/` directly.**
 
-# Spawn a NEW agent process that takes an actas identity on boot.
-# Pre-joins <name> to a team, then launches the agent CLI in a tmux pane/window
-# (when run inside tmux) or a new OS terminal, with `/agmsg actas <name>` as the
-# initial prompt. By default it BLOCKS until the new agent's watcher attaches
-# (prints `status=ready`), so a leader can send work right after spawn returns
-# without losing it to the agent's cold start. claude-code/codex only; macOS
-# primary, Linux/Windows best-effort. Non-tmux + no usable terminal (headless)
-# errors out.
-#   --project <path>     project to launch in (default: $PWD)
-#   --team <team>        team to join into (default: auto-resolved from project)
-#   --window             new tmux window instead of splitting the current one
-#   --split h|v          tmux split direction (default h)
-#   --terminal <tmpl>    terminal command template ({cmd} = path to the boot
-#                        script) for the non-tmux path; overrides $AGMSG_TERMINAL
-#                        / config spawn.terminal. macOS default uses `open -a`
-#                        (no Automation/TCC permission prompt).
-#   --no-wait            don't block on readiness (fire-and-forget)
-#   --ready-timeout N    seconds to wait for readiness (default 90; on timeout
-#                        prints status=timeout and exits 3). Codex skips the
-#                        wait (it has no Monitor).
-#   --boot-prompt <text>      hand the new agent an initial task: the boot prompt
-#                        becomes the actas command followed (newline-separated)
-#                        by <text>, so it claims its identity AND starts the task
-#                        in its first turn. The only way to give a one-shot goal
-#                        to a codex peer (no Monitor → a post-spawn send to its
-#                        idle session is never noticed).
-~/.agents/skills/agmsg/scripts/spawn.sh <claude-code|codex> <name> [options]
+**If no arguments provided (DEFAULT action — always do this when the command is invoked without arguments):**
+1. **IMMEDIATELY** run inbox check for each TEAM: `~/.agents/skills/agmsg/scripts/inbox.sh $TEAM $AGENT`
+2. Do NOT ask the user what to do — just run the inbox check.
+3. If there are messages, read and respond appropriately. To reply:
+   `~/.agents/skills/agmsg/scripts/send.sh $TEAM $AGENT <to_agent> "<message>"`
 
-# Tear down a spawned member — the inverse of spawn.
-# Default (graceful): sends a `ctrl:despawn` control message to <name>; the
-# member's watcher drops its own role (releasing the actas lock + registration)
-# and closes its own tmux pane, ending the agent. Blocks until the lock releases
-# (--timeout, default 30s) then prints `status=ok`; on timeout prints
-# status=timeout and exits 3 (retry with --force). Only an exclusive watcher
-# dedicated to <name> acts on it — the despawning session is never torn down.
-# --force: skip the message and tear the member down from the placement recorded
-# at spawn time (kill its tmux pane/window, drop its registration) — for a dead
-# watcher or a codex member (no Monitor). A hand-started member with no placement
-# record can't be --forced.
-#   --force              tear down from the recorded placement, no message
-#   --timeout N          seconds to wait for graceful teardown (default 30)
-~/.agents/skills/agmsg/scripts/despawn.sh <team> <from> <name> [--force] [--timeout N]
-```
+If argument is "history":
+1. Run: `~/.agents/skills/agmsg/scripts/history.sh $TEAM $AGENT`
 
-### Rename
+If argument starts with "team list" (e.g. "team list", "team list --json", "team list --scope project"):
+1. Run: `~/.agents/skills/agmsg/scripts/team-list.sh <the rest of the args after "team list", unchanged>`
+2. This is a distinct command from bare "team" below — check for "team list" FIRST so "list" is never mistaken for a team name.
+
+If argument is "team":
+1. For each TEAM, run: `~/.agents/skills/agmsg/scripts/team.sh $TEAM`
+
+If argument starts with "send" (e.g. "send misaki check the server"):
+1. Parse target agent and message from the arguments
+2. Determine which team the target agent belongs to, then run:
+   `~/.agents/skills/agmsg/scripts/send.sh $TEAM $AGENT <to_agent> "<message>"`
+
+If argument is "config":
+1. Run: `~/.agents/skills/agmsg/scripts/config.sh show`
+2. Show the output to the user.
+
+If argument starts with "config set" (e.g. "config set hook.check_interval 30"):
+1. Parse key and value from the arguments.
+2. Run: `~/.agents/skills/agmsg/scripts/config.sh set <key> <value>`
+
+
+If argument starts with "actas" followed by an agent name (e.g. "actas alice"):
+1. Parse the new role name. If none was given (e.g. bare "actas", or the user asks you to suggest one), run `~/.agents/skills/agmsg/scripts/team.sh <team>` for each TEAM to see the current roster. Look for a naming convention already in play (e.g. a shared base name with role and number suffixes (`<base>-<role><n>`), or names derived from the team name) and, when one exists, propose 2-3 unused names that extend it; otherwise propose 2-3 short, distinctive identity names (not a bare tool-type label). Either way, names must not collide with the roster. Ask the user to pick one or type their own before continuing.
+2. Run `~/.agents/skills/agmsg/scripts/identities.sh "$(pwd)" codex` to see whether the role is already registered for this (project, type).
+3. If the name does not appear in the output, join under the existing team. For a single team, run `~/.agents/skills/agmsg/scripts/join.sh <team> <name> codex "$(pwd)"`. For multiple teams, ask the user which team to join the new role into.
+4. Set the session's active FROM to `<name>` for every `send.sh` call until another `actas`.
+5. Record this session as the role's seat so it can be resumed later (best-effort): determine which team `<name>` belongs to (from the identities output / the join above), then run `~/.agents/skills/agmsg/scripts/drivers/types/codex/codex-record-session.sh <team> <name>` (the script resolves the project directory itself). It writes the record only when this session's codex thread id is unambiguous; otherwise it records nothing and the role simply boots fresh next time (no harm). This is what lets a later `spawn <role>` bring the role back into this conversation.
+6. Tell the user: "Now acting as `<name>`. Sends will use `<name>` as the from agent. In monitor mode, each role's incoming messages are routed only to that role's recorded Codex thread; roles without a recorded thread remain unread."
+
+If argument starts with "drop" followed by an agent name (e.g. "drop alice"):
+1. Parse the role name.
+2. Run `~/.agents/skills/agmsg/scripts/reset.sh "$(pwd)" codex <name>` to remove that role's registration.
+3. If the session's active FROM was `<name>`, clear that state.
+4. Tell the user: "Dropped role `<name>` from this project."
+
+If argument starts with "spawn" (e.g. "spawn claude-code alice", "spawn codex reviewer --window"):
+1. Parse `<type>` (must be `claude-code` or `codex`), `<name>`, and any options (`--project`, `--team`, `--window`, `--split h|v`, `--terminal`, `--no-wait`, `--ready-timeout <secs>`).
+2. Run: `~/.agents/skills/agmsg/scripts/spawn.sh <type> <name> --project "$(pwd)" [options]`
+   - spawn.sh pre-joins `<name>`, then opens a tmux pane/window (when this session is inside tmux) or a new OS terminal, and launches the target CLI with `/agmsg actas <name>` as its initial prompt.
+   - By default it BLOCKS until a spawned claude-code agent's watcher attaches (`status=ready`); `status=timeout` + exit 3 if not ready within `--ready-timeout` (default 90s). `--no-wait` for fire-and-forget. Spawning a codex agent skips the wait (codex has no Monitor).
+   - It refuses early if `<name>` is already held by another live session, if the target CLI is not installed, or if there is no tmux and no usable terminal (headless).
+3. Show the script's output.
+
+If argument starts with "despawn" (e.g. "despawn reviewer", "despawn alice --force"):
+1. Parse `<name>` and any options (`--force`, `--timeout <secs>`). `despawn` is the inverse of `spawn` — it tears down a member you previously spawned.
+2. Determine which team `<name>` belongs to (as with `send`), then run:
+   `~/.agents/skills/agmsg/scripts/despawn.sh <team> $AGENT <name> [--force] [--timeout <secs>]`
+   - Default (graceful): sends a `ctrl:despawn` control message to `<name>`. A claude-code member's watcher drops its own role and closes its own tmux pane, ending the agent. Blocks until the lock releases, up to `--timeout` (default 30s), then prints `status=ok`. On timeout it prints `status=timeout` and exits 3 — retry with `--force`. A codex member has no watcher to respond, so use `--force` for it.
+   - `--force`: skips the message and tears the member down from the placement recorded at spawn time — kills its tmux pane/window and drops its registration.
+3. Show the script's output.
+
+If argument is "mode" (no further args):
+1. Run: `~/.agents/skills/agmsg/scripts/delivery.sh status codex "$(pwd)"`
+2. Show the output to the user.
+
+If argument starts with "mode" followed by a mode name (e.g. "mode monitor"):
+1. Parse the mode. Codex supports `monitor` (app-server bridge), `turn`, and `off` — reject `both` with: "The Codex bridge supports `monitor`, `turn`, or `off`; `both` is not supported yet."
+2. Run: `~/.agents/skills/agmsg/scripts/delivery.sh set <mode> codex "$(pwd)"`
+3. If mode is `monitor`, tell the user: "Codex monitor is enabled. Add the printed shell function to your shell profile, restart the shell, then launch future sessions with normal `codex`. If you prefer a global PATH shim, run `~/.agents/skills/agmsg/scripts/drivers/types/codex/codex-shim-install.sh install` and put `~/.agents/bin` first on PATH. You can also use `~/.agents/skills/agmsg/scripts/drivers/types/codex/codex-monitor.sh` for explicit monitor launches. The bridge starts on the **first turn** of a new Codex session (the SessionStart hook fires on your first message, not the moment Codex opens), so **restart your Codex session and send one message for monitor to take effect** — this already-running session stays unmonitored until it restarts. For more info: https://github.com/fujibee/agmsg/blob/main/docs/codex-monitor-beta.md"
+
+If argument is "hook on" (legacy alias):
+1. Run: `~/.agents/skills/agmsg/scripts/delivery.sh set turn codex "$(pwd)"`
+2. Tell the user: "Delivery mode set to 'turn' (legacy hook on behavior)."
+
+If argument is "hook off" (legacy alias):
+1. Run: `~/.agents/skills/agmsg/scripts/delivery.sh set off codex "$(pwd)"`
+2. Tell the user: "Delivery mode set to 'off'."
+
+If argument is "version":
+1. Run: `~/.agents/skills/agmsg/scripts/version.sh`
+2. Show the output — the installed version (git-describe provenance recorded at install time).
+
+If argument is "reset":
+1. Run: `~/.agents/skills/agmsg/scripts/reset.sh "$(pwd)" codex`
+2. Tell the user the result.
 
 If argument starts with "rename" but not "rename-team":
-1. Accept only an explicit user request. Parse either `<team> <old_name> <new_name>`,
-   or `<old_name> <new_name>` only when this agent belongs to exactly one team.
-2. Never invent either name. Before execution, repeat the resolved team, old name,
-   and new name and ask the user to confirm. Wait for confirmation.
+1. Accept only an explicit user request. Parse either `<team> <old_name> <new_name>`, or `<old_name> <new_name>` only when this agent belongs to exactly one team.
+2. Never invent either name. Before execution, repeat the resolved team, old name, and new name and ask the user to confirm. Wait for confirmation.
 3. Run: `bash ~/.agents/skills/agmsg/scripts/rename.sh <team> <old_name> <new_name>`
-4. Show the result. For a connected team, the `member_renamed` journal event
-   propagates the rename to other machines.
+4. Show the result. For a connected team, the `member_renamed` journal event propagates the rename to other machines.
 
 If argument starts with "rename-team":
 1. Accept only an explicit user request. Parse `<old_team> <new_team>`.
-2. Never invent either team name. Before execution, repeat the old and new team
-   names and ask the user to confirm. Wait for confirmation.
+2. Never invent either team name. Before execution, repeat the old and new team names and ask the user to confirm. Wait for confirmation.
 3. Run: `bash ~/.agents/skills/agmsg/scripts/rename-team.sh <old_team> <new_team>`
 4. Show the result.
-
-### Remote sync
-
-Remote setup is no-auth. Do not ask for a token or create one.
 
 If argument starts with "remote connect":
 1. Parse the required `--endpoint <url>` and `<team>`, plus optional `--e2ee`.
 2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh connect --endpoint <url> [--e2ee] <team>`
-3. Show the output to the user. Plain sync is the default; pass `--e2ee` only
-   when the user explicitly requests end-to-end encryption. The choice is
-   fixed by the first connect.
-4. End by showing this copy-paste command for the other machine, with the
-   actual endpoint and team substituted:
-   `bash ~/.agents/skills/agmsg/scripts/remote.sh pull --endpoint <actual-url> <actual-team>`
+3. Show the output to the user. Plain sync is the default; pass `--e2ee` only when the user explicitly requests end-to-end encryption. The choice is fixed by the first connect.
+4. End by showing this copy-paste command for the other machine, with the actual endpoint and team substituted: `bash ~/.agents/skills/agmsg/scripts/remote.sh pull --endpoint <actual-url> <actual-team>`
 
 If argument starts with "remote pull":
-1. When the user asks to join or bring in a team that already exists on a
-   server, NEVER use `join.sh`, create a team, or create a same-named local
-   team. Always use remote pull.
-2. Before pulling, check for a same-named local team. If one already exists
-   without an active remote connection, stop and ask the user how to proceed;
-   do not overwrite, merge, connect, or rename it on your own.
-3. Parse the required `--endpoint <url>` and `<team>`, plus optional
-   `--team-id <uuid>`.
+1. When the user asks to join or bring in a team that already exists on a server, NEVER use `join.sh`, create a team, or create a same-named local team. Always use remote pull.
+2. Before pulling, check for a same-named local team. If one already exists without an active remote connection, stop and ask the user how to proceed; do not overwrite, merge, connect, or rename it on your own.
+3. Parse the required `--endpoint <url>` and `<team>`, plus optional `--team-id <uuid>`.
 4. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh pull --endpoint <url> [--team-id <uuid>] <team>`
 5. Show the output to the user.
 
@@ -235,17 +218,16 @@ environment variables alone succeeds, and the send that is supposed to confirm
 it then reports the team as missing — the failure lands one step after the
 cause. See "Use a separate install for testing" in `docs/remote-setup.md`.
 
+**What e2ee changes, and what it doesn't.** The local store stays plaintext either way — `history`, `inbox`, and `send` read and write exactly the same regardless of a team's encryption setting. Only the SERVER side differs: an e2ee team's server rows carry `cipher: age-v1` and hold sealed ciphertext, so `from`, `to`, and `body` are not readable there; a plain team's rows are not sealed. Keys never pass through the server — moving one to another machine means carrying a handoff bundle by hand (`key handoff` above).
+
+**Readable local history is therefore not evidence that a team is unencrypted.** To state whether a given team is e2ee, ask the program — `remote status <team>` below — never infer it from what you can read locally.
+
 If argument starts with "remote unlock":
 1. Parse `<team>`, `--bundle <file>`, and `--confirm-digest <sha256>`.
 2. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh unlock <team> --bundle <file> --confirm-digest <sha256>`
-3. The snapshot digest must be compared over a separate live channel. Never
-   infer or auto-confirm it. The bundle is permanent secret key material; tell
-   the user to transfer and handle it only through their own trusted channel,
-   never by pasting it into agent chat.
-4. Show the complete result, including the imported-envelope count and engine
-   PID.
-5. The advanced form with repeatable `--snapshot` plus `--identity` or
-   `--identity-stdin` remains available when explicitly requested.
+3. The snapshot digest must be compared over a separate live channel. Never infer or auto-confirm it. The bundle is permanent secret key material; tell the user to transfer and handle it only through their own trusted channel, never by pasting it into agent chat.
+4. Show the complete result, including the imported-envelope count and engine PID.
+5. The advanced form with repeatable `--snapshot` plus `--identity` or `--identity-stdin` remains available when explicitly requested.
 
 If argument starts with "remote status":
 1. Parse an optional `<team>` and `--json`.
@@ -263,110 +245,40 @@ If argument starts with "remote disconnect":
 3. Show the output to the user.
 
 If argument starts with "remote forget":
-1. Parse the required `<team>`. This permanently deletes that team's local
-   roster, history, keys, trust, and sync state, but never changes the server.
-2. Do not add `--yes` yourself. Run:
-   `bash ~/.agents/skills/agmsg/scripts/remote.sh forget <team>`
-3. The command requires the user to confirm in their terminal. If this agent
-   has no interactive terminal, show the deletion summary and tell the user to
-   rerun the displayed command directly; never bypass confirmation for them.
-
-### End-to-end encryption
+1. Parse the required `<team>`. This permanently deletes that team's local roster, history, keys, trust, and sync state, but never changes the server.
+2. Do not add `--yes` yourself. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh forget <team>`
+3. The command requires the user to confirm in their terminal. If this agent has no interactive terminal, show the deletion summary and tell the user to rerun the displayed command directly; never bypass confirmation for them.
 
 If argument starts with "key generate" followed by an optional team name:
-1. Run: `bash ~/.agents/skills/agmsg/scripts/key.sh generate [<team>]`
-2. Show the full output to the user, including the mandatory key-backup notice.
+1. Run: `~/.agents/skills/agmsg/scripts/key.sh generate [<team>]`
+2. Show the full output to the user, including the mandatory key-backup notice — do not summarize it away.
 
 If argument starts with "key show":
 1. Parse an optional team name and `--reveal-secret`.
-2. Run: `bash ~/.agents/skills/agmsg/scripts/key.sh show [<team>] [--reveal-secret]`
-3. `--reveal-secret` requires a real interactive terminal and is refused in
-   agent mode. Tell the user to run it directly in their own terminal.
+2. Run: `~/.agents/skills/agmsg/scripts/key.sh show [<team>] [--reveal-secret]`
+3. `--reveal-secret` requires a real interactive terminal and is refused in agent mode — if the user wants to reveal a secret, tell them to run it themselves directly in their own terminal rather than through you.
 4. Show the output to the user.
 
 If argument starts with "key handoff" followed by a team name:
-1. Parse optional `--out <file>` and run:
-   `bash ~/.agents/skills/agmsg/scripts/key.sh handoff <team> [--out <file>]`
-2. The output bundle contains every epoch identity and is itself permanent
-   secret key material. Never read it into agent chat or display its contents.
+1. Parse optional `--out <file>` and run: `bash ~/.agents/skills/agmsg/scripts/key.sh handoff <team> [--out <file>]`
+2. The output bundle contains every epoch identity and is itself permanent secret key material. Never read it into agent chat or display its contents.
 3. Show the bundle path, latest snapshot digest, and full secrecy warning.
 
 If argument starts with "key import" followed by a team name:
-1. Do not ask the user to paste the private identity into this chat, and do not
-   run the command yourself. Tell the user to run this in their own terminal:
+1. **Do not ask the user to paste the private identity into this chat, and do not run this command yourself.** This identity is a permanent secret. Tell the user to run this directly in their own terminal:
    ```
    read -rsp 'Identity: ' IDENTITY; echo
    printf '%s' "$IDENTITY" | ~/.agents/skills/agmsg/scripts/key.sh import <team> --identity-stdin
    unset IDENTITY
    ```
-2. Ask them to paste back only the command output, never the identity itself.
-3. Do not offer an environment-variable path. An identity file is a permanent
-   secret; always use the human-in-own-terminal flow above.
+2. Ask them to paste back only the command's output (never the identity itself) once it's done.
+3. **No advanced/automation env-var path is offered for key import** — not even a pre-existing, before-session variable. An identity file is a permanent secret; always use the human-in-own-terminal flow above.
 
 If argument starts with "key rotate" followed by a team name:
-1. Rotation mints a replacement epoch for a team that already has a key and
-   announces it on the roster journal. It requires an existing current key, an
-   identity journal (connect or migrate the team first), and `age`; it refuses
-   with a message naming whichever is missing.
-2. Confirm with the user before running it. It changes the team's key state,
-   and every other machine has to receive the new identity out of band.
+1. Rotation mints a replacement epoch for a team that already has a key and announces it on the roster journal. It requires an existing current key, an identity journal (connect or migrate the team first), and `age`; it refuses with a message naming whichever is missing.
+2. Confirm with the user before running it. It changes the team's key state, and every other machine has to receive the new identity out of band.
 3. Run: `bash ~/.agents/skills/agmsg/scripts/key.sh rotate <team>`
-4. Show the output: epoch, key_id, and recipient fingerprint. The private key
-   is never written to the journal. Revealing it needs
-   `key show <team> --key-id <id> --reveal-secret`, which is refused in agent
-   mode — tell the user to run that in their own terminal.
-5. Messages before the acknowledged rotation boundary remain readable with the
-   old key.
+4. Show the output: epoch, key_id, and recipient fingerprint. The private key is never written to the journal. Revealing it needs `key show <team> --key-id <id> --reveal-secret`, which is refused in agent mode — tell the user to run that in their own terminal.
+5. Messages before the acknowledged rotation boundary remain readable with the old key.
 
-Device pairing (`key request` / `key approve`) is not implemented — they are
-not `key.sh` subcommands, so a call prints usage and exits 1. If the user asks
-for one, tell them so instead of attempting to run it.
-
-## Permission prompts (Claude Code)
-
-Every agmsg step above runs through the host's Bash tool, so on Claude Code each call is gated by the permission system until you allowlist the script directory. Add these to `~/.claude/settings.json` (or project-level `.claude/settings.local.json`):
-
-```json
-{
-  "permissions": {
-    "allow": [
-      "Bash(~/.agents/skills/agmsg/scripts/*)",
-      "Bash(/Users/<you>/.agents/skills/agmsg/scripts/*)",
-      "Bash(bash ~/.agents/skills/agmsg/scripts/*)",
-      "Bash(bash /Users/<you>/.agents/skills/agmsg/scripts/*)"
-    ]
-  }
-}
-```
-
-Four entries rather than one because a rule matches the command string as written: the scripts are invoked both as `~/...` and as an absolute path, and with or without an explicit `bash` prefix. Replace `/Users/<you>` with your home directory, and the `agmsg` path segment with your command name if you installed under a different one.
-
-**Every subcommand needs its own match.** [Claude Code's permission docs](https://code.claude.com/docs/en/permissions) state that a rule must match each subcommand independently, and that the recognized separators are `&&`, `||`, `;`, `|`, `|&`, `&`, and newlines. Chaining two agmsg scripts is fine — both match the entries above. What reintroduces the prompt is mixing in a command those entries do not cover: `delivery.sh status … ; printenv AGMSG_SPAWNED` prompts because of the `printenv`, not because of the `;`. Splitting it into its own call does not remove that prompt — it only keeps it from gating the agmsg call. Allowlist the command as well if it needs to be prompt-free.
-
-## Sandbox compatibility (Claude Code)
-
-When Claude Code's sandbox is enabled, `watch.sh` (monitor mode) runs inside the sandbox and needs to write pidfiles and SQLite WAL files under `~/.agents/skills/agmsg/`. Add an allowlist entry to `~/.claude/settings.json` (or project-level `.claude/settings.local.json`):
-
-```json
-{
-  "sandbox": {
-    "filesystem": {
-      "allowWrite": [
-        "~/.agents/skills/agmsg/"
-      ]
-    }
-  }
-}
-```
-
-The allowlist merges across scopes and takes effect immediately — no restart needed. If agmsg was installed under a custom command name (e.g. `m`), adjust the path accordingly.
-
-**Note on `BASH_SOURCE`**: The sandboxed Bash tool runs commands via pipe/eval, so `BASH_SOURCE[0]` is empty inside sourced functions like `storage.sh`. This is handled internally — `watch.sh` resolves `SKILL_DIR` from `$0` (which works correctly when invoked as a command), and `storage.sh` falls back to that value. No user configuration needed.
-
-## Architecture
-
-- **Storage**: SQLite with WAL mode in `~/.agents/skills/agmsg/db/messages.db`
-- **Teams**: `~/.agents/skills/agmsg/teams/<name>/config.json`
-- **Concurrency**: WAL allows multiple readers + 1 writer without conflicts
-- **No daemon**: Direct DB access via `sqlite3` CLI
-- **Dependencies**: bash, sqlite3 (no python3 required) for core messaging; `remote`/`key` additionally need `curl`, `python3`, and `age`/`age-keygen`, but only if those commands are used
+Device pairing (`key request` / `key approve`) is not implemented — they are not `key.sh` subcommands, so a call prints usage and exits 1. If the user asks for one, tell them so instead of attempting to run it.
