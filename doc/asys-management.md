@@ -53,3 +53,8 @@ Migration provenance and archive hashes are in
 Transport acceptance, recipient input, recipient response, and delivery of
 that response back to the originating session are separate verification
 gates. Source migration alone does not establish Desktop-to-Desktop push.
+
+The experimentally verified Claude-command-to-Codex Desktop route is documented
+in [Codex Desktop IPC sending](codex-desktop-ipc-send.md), with a separate
+[verification record](verification/claude-to-codex-ipc-261009.md).
+It is not yet an agmsg delivery adapter.
