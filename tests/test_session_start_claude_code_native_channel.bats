@@ -102,6 +102,21 @@ _mark_daemon_ready() {
   grep -qF "agmsgd is running and will deliver" <<<"$output"
 }
 
+# rc.2: an old record of the same session under a team that is no longer
+# registered used to make the seat lookup ambiguous, so the switch to direct
+# delivery was dropped without a word. Only registered pairs count now.
+@test "session-start: a stale record of an unregistered team does not block the switch to direct delivery" {
+  _mark_daemon_ready
+  env AGMSG_AGENT_PID=$$ bash "$SCRIPTS/actas-claim.sh" "$PROJ" claude-code alice "sid-stale-twin" >/dev/null
+  source "$SCRIPTS/lib/role-session.sh"
+  agmsg_role_session_record gone-team alice "sid-stale-twin" "$PROJ" claude-code
+  run env AGMSG_AGENT_PID=$$ AGMSG_RESOLVE_PROJECT=0 CLAUDE_CODE_MESSAGING_SOCKET="uds:/tmp/cc-socks/sid-stale-twin.sock" \
+    bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< '{"session_id":"sid-stale-twin"}'
+  [ "$status" -eq 0 ]
+  refute grep -q "AGMSG monitor mode" <<<"$output"
+  grep -qF "agmsgd is running and will deliver" <<<"$output"
+}
+
 @test "session-start: agmsgd not running -> the usual Monitor directive still fires" {
   run _run_session_start "sid-no-daemon"
   [ "$status" -eq 0 ]
