@@ -311,6 +311,23 @@ EOF
   grep -q '^locked bootout$' "$events"
 }
 
+@test "daemon.sh enable: an install.db left by --update with the 2-column meta still enables" {
+  [ "$(uname -s)" = "Darwin" ] || skip "this test's fake stands in for launchd specifically"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "CREATE TABLE meta (schema_version INTEGER NOT NULL, install_id TEXT NOT NULL); INSERT INTO meta VALUES (1, 'daemon-sh-test');"
+  _write_completion_record
+  local fake_launchctl
+  fake_launchctl="$(_fake_launchctl)"
+
+  AGMSGD_LAUNCHCTL="$fake_launchctl" AGMSGD_FAKE_LAUNCHD_MARKER="$TEST_SKILL_DIR/fake-launchd/registered" AGMSGD_FAKE_LAUNCHD_EVENTS="$TEST_SKILL_DIR/fake-launchd/events" AGMSGD_FAKE_OP_LOCK_DB="$TEST_SKILL_DIR/run/install-op.lock.db" AGMSGD_TEST_LAUNCHER="$SCRIPTS/daemon/agmsgd-launch.sh" \
+    run bash "$DAEMON" enable
+  [ "$status" -eq 0 ]
+  [ "$(sqlite3 "$TEST_SKILL_DIR/run/install.db" "SELECT install_id FROM meta;")" = "daemon-sh-test" ]
+  [ "$(sqlite3 "$TEST_SKILL_DIR/run/install.db" "SELECT desired FROM daemon_intent;")" = "on" ]
+  AGMSGD_LAUNCHCTL="$fake_launchctl" AGMSGD_FAKE_LAUNCHD_MARKER="$TEST_SKILL_DIR/fake-launchd/registered" AGMSGD_FAKE_LAUNCHD_EVENTS="$TEST_SKILL_DIR/fake-launchd/events" AGMSGD_FAKE_OP_LOCK_DB="$TEST_SKILL_DIR/run/install-op.lock.db" \
+    bash "$DAEMON" disable >/dev/null 2>&1 || true
+}
+
 @test "daemon.sh start: stale ready state asks the registered manager to start the service" {
   [ "$(uname -s)" = "Darwin" ] || skip "this test's fake stands in for launchd specifically"
   _seed_install_db
