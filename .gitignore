@@ -14,3 +14,7 @@ teams/
 .env
 .env.*
 /.secrets/
+
+# Generated Python caches are not source.
+__pycache__/
+*.pyc
