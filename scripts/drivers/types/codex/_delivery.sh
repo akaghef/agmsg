@@ -9,6 +9,11 @@
 # in scope.
 # Args (both hooks): on_enable <mode> <type> <project>; on_disable <type> <project>.
 
+agmsg_delivery_status() {
+  agmsg_delivery_status_default "$@"
+  echo "The mode above is hook configuration; separately launched Codex app-server delivery is reported by bridge runtime status below."
+}
+
 agmsg_delivery_on_enable() {
   echo "Codex monitor is enabled."
   echo "Add this shell function to your interactive shell profile, then restart the shell:"

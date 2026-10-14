@@ -2231,6 +2231,7 @@ EOF
   run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [[ "$output" == *"mode: monitor"* ]]
+  [[ "$output" == *"mode above is hook configuration"* ]]
   [[ "$output" == *"Codex bridge: team/alice alive (pid $bpid)"* ]]
   [[ "$output" != *"watch processes:"* ]]
 
