@@ -1,1 +1,5 @@
+* text=auto eol=lf
+*.sh text eol=lf
+
+# Archived diffs retain their original patch whitespace.
 doc/migration/*.patch -whitespace
