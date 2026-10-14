@@ -119,7 +119,7 @@ EOF
       return 0
     fi
   elif [ "$_n" -gt 1 ]; then
-    echo "AGMSG delivery: agmsgd is running, but this session is recorded as $_n registered seats, so the native channel is not used. Next: run /agmsg actas <name> to pick one, or arm the Monitor below."
+    echo "AGMSG delivery: agmsgd is running, but this session is recorded under $_n registered seats, so the native channel is not used. Next: arm the Monitor below; the extra records stay until they are cleaned up."
     return 0
   fi
 
@@ -134,9 +134,10 @@ EOF
   # "owning" the same pair, while a real --resume (new pid, old pid now
   # dead) correctly reclaims.
   local claim_result
-  claim_result="$(actas_lock_claim "$pair_team" "$pair_agent" "$my_instance" 2>/dev/null)" || claim_result="unknown:claim_failed"
+  claim_result="$(actas_lock_claim "$pair_team" "$pair_agent" "$my_instance" 2>/dev/null || true)"
+  [ -n "$claim_result" ] || claim_result="unknown:claim_failed"
   if [ "$claim_result" != ok ]; then
-    echo "AGMSG delivery: agmsgd is running, but seat $pair_agent@$pair_team is held by another live session ($claim_result), so the native channel is not used. Next: arm the Monitor below, or run /agmsg actas $pair_agent to take it over."
+    echo "AGMSG delivery: agmsgd is running, but seat $pair_agent@$pair_team could not be claimed ($claim_result), so the native channel is not used. Next: arm the Monitor below."
     return 0
   fi
 
