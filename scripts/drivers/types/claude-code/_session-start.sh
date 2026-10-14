@@ -102,8 +102,22 @@ agmsg_session_start() {
 ${PAIRS:-}
 EOF
   if [ "$_n" -eq 0 ]; then
-    echo "AGMSG delivery: agmsgd is running, but no registered seat of this project is recorded for this session, so the native channel is not used. Next: run /agmsg actas <name>, or arm the Monitor below."
-    return 0
+    # Nothing recorded for this session. The seat is still decided when this
+    # project has exactly one registered pair of this type: that is the seat
+    # session-start.sh's own Monitor directive would watch (it only falls
+    # back to the generic watcher for a single pair), so take it.
+    if [ "$(printf '%s\n' "${PAIRS:-}" | grep -c '.' || true)" -eq 1 ]; then
+      IFS="$_tab" read -r pair_team pair_agent <<EOF
+${PAIRS:-}
+EOF
+      if [ -z "$(agmsg_role_session_get "$pair_team" "$pair_agent" type 2>/dev/null || true)" ]; then
+        agmsg_role_session_record "$pair_team" "$pair_agent" "$bare_sid" \
+          "$(agmsg_canonical_path "${PROJECT:-}" 2>/dev/null || printf '%s' "${PROJECT:-}")" "${TYPE:-}"
+      fi
+    else
+      echo "AGMSG delivery: agmsgd is running, but this project has several registered seats and none is recorded for this session, so the native channel is not used. Next: run /agmsg actas <name>, or arm the Monitor below."
+      return 0
+    fi
   elif [ "$_n" -gt 1 ]; then
     echo "AGMSG delivery: agmsgd is running, but this session is recorded as $_n registered seats, so the native channel is not used. Next: run /agmsg actas <name> to pick one, or arm the Monitor below."
     return 0

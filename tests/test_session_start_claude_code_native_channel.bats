@@ -123,17 +123,21 @@ _mark_daemon_ready() {
   grep -qF "AGMSG monitor mode" <<<"$output"
 }
 
-# The counterexample #1577 review required: daemon ready is NOT enough by
-# itself. A seat that was only joined (never actas-claimed, so it has no
-# role-session record at all, let alone a messaging_socket field) must keep
-# its only delivery path -- Monitor -- rather than be silenced on the
-# assumption the daemon can reach it.
-@test "session-start: agmsgd ready but NO role-session record -> Monitor directive still fires" {
+# #1577 review required a seat with no record to keep Monitor, since the
+# daemon cannot address it. rc.2 (the new path is the default)
+# reverses that for the one case where the seat is not in doubt: the project
+# has a single registered pair of this type, which is the seat the Monitor
+# directive itself would watch. Nothing is recorded and no lock exists (the
+# shape of a seat never recorded); the switch writes the record and takes the lock.
+@test "session-start: agmsgd ready, NO record, NO lock, one registered seat -> switches to direct delivery" {
   _mark_daemon_ready
-  run _run_session_start "sid-ready-no-record"
+  run env AGMSG_AGENT_PID=$$ AGMSG_RESOLVE_PROJECT=0 CLAUDE_CODE_MESSAGING_SOCKET="uds:/tmp/cc-socks/sid-ready-no-record.sock" \
+    bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< '{"session_id":"sid-ready-no-record"}'
   [ "$status" -eq 0 ]
-  grep -qF "AGMSG monitor mode" <<<"$output"
-  refute grep -q "agmsgd is running and will deliver" <<<"$output"
+  refute grep -q "AGMSG monitor mode" <<<"$output"
+  grep -qF "agmsgd is running and will deliver" <<<"$output"
+  source "$SCRIPTS/lib/role-session.sh"
+  [ "$(agmsg_role_session_get team alice messaging_socket)" = /tmp/cc-socks/sid-ready-no-record.sock ]
 }
 
 # #1577 re-review: comparing only the BARE session id let one process
