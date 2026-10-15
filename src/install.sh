@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LIVE="$HOME/.agents/skills/agmsg"
 # Scoped maintenance uses this same managed install entry point. It must not
 # rerun hook merging, migrate stores, refresh shims, or replace unrelated code.
-if [[ "${1:-}" == "--codex-delivery-only" || "${1:-}" == "--codex-capability-info-only" || "${1:-}" == "--send-journal-only" || "${1:-}" == "--session-delivery-only" ]]; then
+if [[ "${1:-}" == "--codex-delivery-only" || "${1:-}" == "--codex-capability-info-only" || "${1:-}" == "--send-journal-only" || "${1:-}" == "--session-delivery-only" || "${1:-}" == "--identity-spawn-only" ]]; then
   INSTALLED_REVISION=""
   if [[ $# -gt 2 ]]; then
     [[ $# -eq 4 && "$1" == "--session-delivery-only" && "$3" == "--installed-revision" ]] || {
@@ -47,6 +47,7 @@ paths={
   'scripts/agmsg-routing/hooks/session-start.sh',
   'scripts/route.sh',
  ],
+ '--identity-spawn-only':['scripts/whoami.sh','scripts/spawn.sh','scripts/drivers/types/codex/type.conf'],
 }[scope]
 source_names={'scripts/route.sh':'mod/asys-routing/route.sh'} if scope=='--send-journal-only' else {}
 if scope=='--session-delivery-only':
