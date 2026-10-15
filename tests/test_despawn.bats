@@ -16,12 +16,21 @@ setup() {
   # did not (the #439 read_at test, added after this file first grew herdr
   # awareness) is exactly how a real host pane got closed.
   unset HERDR_ENV HERDR_PANE_ID HERDR_WORKSPACE_ID
-  export PROJ="/tmp/agmsg-despawn-proj"
+  # Match the native owner tokens used by setup_live_owner, independent of the
+  # parent agent running Bats. Keep the project real and canonically spelled.
+  export AGMSG_AGENT_PID=""
+  mkdir -p "$TEST_SKILL_DIR/project"
+  export PROJ="$(cd "$TEST_SKILL_DIR/project" && pwd -P)"
+  DESPAWN_TEST_WATCH_PID=""
   export RUN="$TEST_SKILL_DIR/run"
   mkdir -p "$RUN"
 }
 
 teardown() {
+  if [ -n "$DESPAWN_TEST_WATCH_PID" ]; then
+    kill "$DESPAWN_TEST_WATCH_PID" 2>/dev/null || true
+    wait "$DESPAWN_TEST_WATCH_PID" 2>/dev/null || true
+  fi
   teardown_test_env
 }
 
@@ -30,6 +39,7 @@ teardown() {
   bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
   # Make the member session look alive so the leader sees a live lock to wait on.
   setup_live_owner "$RUN" sess-m
+  bash "$SCRIPTS/actas-claim.sh" "$PROJ" claude-code alice sess-m >/dev/null
 
   # Unset TMUX_PANE and HERDR_PANE_ID: the ctrl:despawn handler runs
   # `tmux kill-pane` / `herdr pane close`, and a watcher launched from inside
@@ -40,7 +50,8 @@ teardown() {
     bash "$SCRIPTS/watch.sh" sess-m "$PROJ" claude-code alice \
     >/dev/null 2>&1 3>&- &
   local wpid=$! i
-  # Wait for the watcher to attach (it claims the lock + writes the ready sentinel).
+  DESPAWN_TEST_WATCH_PID="$wpid"
+  # Wait for the explicitly bound watcher to attach and write its ready sentinel.
   for i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$RUN/ready.team__alice" ] && break; sleep 0.5; done
   [ -e "$RUN/ready.team__alice" ]
   [ -f "$RUN/actas.team__alice.session" ]
@@ -78,10 +89,12 @@ _control_row_exists_for_alice() {
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
   bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
   setup_live_owner "$RUN" sess-m
+  bash "$SCRIPTS/actas-claim.sh" "$PROJ" claude-code alice sess-m >/dev/null
 
   AGMSG_WATCH_INTERVAL=1 env -u TMUX_PANE bash "$SCRIPTS/watch.sh" sess-m "$PROJ" claude-code alice \
     >/dev/null 2>&1 3>&- &
   local wpid=$! i
+  DESPAWN_TEST_WATCH_PID="$wpid"
   for i in 1 2 3 4 5 6 7 8 9 10; do [ -e "$RUN/ready.team__alice" ] && break; sleep 0.5; done
   [ -e "$RUN/ready.team__alice" ]
 
@@ -144,19 +157,25 @@ _control_row_exists_for_alice() {
 }
 
 @test "despawn: a broad (non-actas) watcher ignores ctrl:despawn and does not self-destruct" {
-  # Regression for the self-kill bug: a leader's default watcher subscribes to
-  # EVERY project role. If it acted on a ctrl:despawn addressed to one of them,
+  # Regression for the self-kill bug: a leader's broad watcher serves several
+  # explicitly bound roles. If it acted on ctrl:despawn addressed to one of them,
   # it would run `tmux kill-pane -t $TMUX_PANE` against the leader's OWN pane and
   # take down the leader session. A broad watcher must skip the control message.
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
   bash "$SCRIPTS/join.sh" team leader claude-code "$PROJ" >/dev/null
   bash "$SCRIPTS/join.sh" team boss claude-code "$PROJ" >/dev/null
 
-  # Broad watcher (no actas arg) — subscribes to both alice and leader.
+  setup_live_owner "$RUN" sess-broad
+  bash "$SCRIPTS/actas-claim.sh" "$PROJ" claude-code alice sess-broad >/dev/null
+  bash "$SCRIPTS/actas-claim.sh" "$PROJ" claude-code leader sess-broad >/dev/null
+
+  # Broad watcher (no role arg) — serves both ACTIVE roles without exclusive
+  # control-message teardown semantics.
   AGMSG_WATCH_INTERVAL=1 env -u TMUX_PANE -u HERDR_PANE_ID -u HERDR_ENV \
     bash "$SCRIPTS/watch.sh" sess-broad "$PROJ" claude-code \
     >/dev/null 2>&1 3>&- &
   local wpid=$! i
+  DESPAWN_TEST_WATCH_PID="$wpid"
   for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$wpid" 2>/dev/null && break; sleep 0.5; done
 
   # Deliver a despawn aimed at alice straight into the stream.

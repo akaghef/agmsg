@@ -148,6 +148,11 @@ agmsg_delivery_apply_default() {
     turn)
       local cmd="$(_agmsg_shq "$SKILL_DIR/scripts/check-inbox.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       add_event_entry_file "$tmp_state" "Stop" "$cmd" "$ww"
+      case "$type" in
+        claude-code|codex)
+          local se="$(_agmsg_shq "$SKILL_DIR/scripts/session-end.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
+          add_event_entry_file "$tmp_state" "SessionEnd" "$se" "$ww" ;;
+      esac
       ;;
     both)
       local ss="$(_agmsg_shq "$SKILL_DIR/scripts/session-start.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"

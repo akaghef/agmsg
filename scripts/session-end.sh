@@ -28,6 +28,7 @@ RUN_DIR="$SKILL_DIR/run"
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
+source "$SCRIPT_DIR/lib/role-session.sh"
 
 # Drop project markers (#92) whose agent process has exited. Liveness-based, so
 # a session that persists across /clear keeps its marker until the process dies.
@@ -40,6 +41,7 @@ if [ -n "$INPUT" ]; then
     | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
     | head -1)
 fi
+[ "$TYPE" != codex ] || SESSION_ID="${CODEX_THREAD_ID:-}"
 [ -z "$SESSION_ID" ] && exit 0
 
 # Re-derive the per-process instance id this session's watcher/locks are keyed
@@ -51,6 +53,8 @@ fi
 # artifacts); we deliberately do NOT glob-delete "<sid>.*", which would kill a
 # living sibling — those are left to session-start's liveness GC instead.
 INSTANCE_ID="$(agmsg_instance_id "$SESSION_ID" "$TYPE")"
+[ "$TYPE" != codex ] || INSTANCE_ID="$SESSION_ID"
+agmsg_role_active_release_all "$TYPE" "$SESSION_ID" "$INSTANCE_ID"
 
 PIDFILE="$RUN_DIR/watch.$INSTANCE_ID.pid"
 if [ -f "$PIDFILE" ]; then

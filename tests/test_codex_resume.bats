@@ -61,6 +61,29 @@ make_rollout() {
 
 # --- codex-record-session.sh ---
 
+# Explicit membership requires a joined role and the current native identity.
+# Existing inference scenarios below now assert rejection, including the exact
+# status, rather than claiming that a matching historical file is the caller.
+record_role() {
+  local team="${1:-}" agent="${2:-}" project="${3:-$PWD}" physical
+  if [ -n "${CODEX_THREAD_ID:-}" ]; then
+    if [ -d "$project" ]; then
+      physical="$(cd "$project" && pwd -P)"
+      case "$physical" in /|/[A-Za-z]) ;;
+        *) bash "$SCRIPTS/join.sh" "$team" "$agent" codex "$project" >/dev/null ;;
+      esac
+    fi
+    bash "$TYPES/codex/codex-record-session.sh" "$@"
+  elif [ -z "$agent" ]; then
+    bash "$TYPES/codex/codex-record-session.sh" "$@"
+  else
+    run bash "$TYPES/codex/codex-record-session.sh" "$@"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *status=unbound* ]] || return 1
+  fi
+}
+
+
 # Read back the recorded uuid for (team, agent).
 recorded_uuid() {
   # shellcheck disable=SC1090
@@ -71,47 +94,53 @@ recorded_uuid() {
 @test "codex record: prefers CODEX_THREAD_ID (unambiguous env path)" {
   local proj; proj="$(mktemp -d)"
   CODEX_THREAD_ID="env-thread-1" \
-    bash "$TYPES/codex/codex-record-session.sh" team alice "$proj"
+    record_role team alice "$proj"
   [ "$(recorded_uuid team alice)" = "env-thread-1" ]
   # type is recorded as codex.
   source "$SKILL_DIR/scripts/lib/role-session.sh"
   [ "$(agmsg_role_session_get team alice type)" = "codex" ]
 }
 
-@test "codex record: falls back to the unique matching-cwd rollout when env is unset" {
+@test "codex record: refuses a unique matching-cwd rollout without native identity" {
   local proj; proj="$(mktemp -d)"
   make_rollout "fallback-uuid" "$proj"
-  ( unset CODEX_THREAD_ID; bash "$TYPES/codex/codex-record-session.sh" team alice "$proj" )
-  [ "$(recorded_uuid team alice)" = "fallback-uuid" ]
+  ( unset CODEX_THREAD_ID; record_role team alice "$proj" )
+  [ -z "$(recorded_uuid team alice)" ]
 }
 
 @test "codex record: records NOTHING when two recent rollouts share the cwd (ambiguous)" {
   local proj; proj="$(mktemp -d)"
   make_rollout "uuid-A" "$proj" "2026/07/05" "2026-07-05T10-00-00"
   make_rollout "uuid-B" "$proj" "2026/07/05" "2026-07-05T11-00-00"
-  ( unset CODEX_THREAD_ID; bash "$TYPES/codex/codex-record-session.sh" team alice "$proj" )
+  ( unset CODEX_THREAD_ID; record_role team alice "$proj" )
   [ -z "$(recorded_uuid team alice)" ]
 }
 
 @test "codex record: records nothing when no rollout matches the cwd" {
   local proj; proj="$(mktemp -d)"
   make_rollout "elsewhere-uuid" "/some/other/cwd"
-  ( unset CODEX_THREAD_ID; bash "$TYPES/codex/codex-record-session.sh" team alice "$proj" )
+  ( unset CODEX_THREAD_ID; record_role team alice "$proj" )
   [ -z "$(recorded_uuid team alice)" ]
 }
 
-@test "codex record: zero matches are silent (grep -c prints 0 AND exits 1)" {
+@test "codex record: missing native identity reports unbound even with zero rollout matches" {
   local proj; proj="$(mktemp -d)"
   make_rollout "elsewhere-uuid" "/some/other/cwd"
   run env -u CODEX_THREAD_ID bash "$TYPES/codex/codex-record-session.sh" team alice "$proj"
-  [ "$status" -eq 0 ]
-  [ -z "$output" ]   # a two-line count would print "[: integer expected" here
+  [ "$status" -eq 1 ]
+  [[ "$output" == *status=unbound* ]] || return 1
   [ -z "$(recorded_uuid team alice)" ]
 }
 
-@test "codex record: missing args are a no-op" {
+@test "codex record: missing or extra args fail explicitly without a binding" {
+  run bash "$TYPES/codex/codex-record-session.sh"
+  [ "$status" -eq 2 ]; [ "$output" = status=invalid_arguments ]
+  run bash "$TYPES/codex/codex-record-session.sh" team
+  [ "$status" -eq 2 ]; [ "$output" = status=invalid_arguments ]
   run bash "$TYPES/codex/codex-record-session.sh" team "" /proj
-  [ "$status" -eq 0 ]
+  [ "$status" -eq 2 ]; [ "$output" = status=invalid_arguments ]
+  run bash "$TYPES/codex/codex-record-session.sh" team alice /proj extra
+  [ "$status" -eq 2 ]; [ "$output" = status=invalid_arguments ]
   [ -z "$(recorded_uuid team alice)" ]
 }
 
@@ -126,17 +155,17 @@ recorded_project() {
   local proj want; proj="$(mktemp -d)"
   want="$(cd "$proj" && pwd -P)"
   ( cd "$proj" && CODEX_THREAD_ID="pwd-thread-1" \
-      bash "$TYPES/codex/codex-record-session.sh" team alice )
+      record_role team alice )
   [ "$(recorded_uuid team alice)" = "pwd-thread-1" ]
   [ "$(recorded_project team alice)" = "$want" ]
 }
 
-@test "codex record: no project arg + no env still finds the rollout via \$PWD" {
+@test "codex record: no project arg + no env refuses the rollout in \$PWD" {
   local proj; proj="$(mktemp -d)"
   make_rollout "pwd-fallback-uuid" "$proj"
   ( unset CODEX_THREAD_ID; cd "$proj" && \
-      bash "$TYPES/codex/codex-record-session.sh" team alice )
-  [ "$(recorded_uuid team alice)" = "pwd-fallback-uuid" ]
+      record_role team alice )
+  [ -z "$(recorded_uuid team alice)" ]
 }
 
 # The lone `\` a PowerShell-parsed \"$PWD\" collapses to (see the script
@@ -144,15 +173,17 @@ recorded_project() {
 # on POSIX it fails the -d check. Either way: no record.
 @test "codex record: backslash project (PowerShell quoting damage) records nothing" {
   CODEX_THREAD_ID="poison-thread" \
-    run bash "$TYPES/codex/codex-record-session.sh" team alice '\'
-  [ "$status" -eq 0 ]
+    run record_role team alice '\'
+  [ "$status" -eq 2 ]
+  [ "$output" = status=invalid_project ]
   [ -z "$(recorded_uuid team alice)" ]
 }
 
 @test "codex record: filesystem-root project records nothing" {
   CODEX_THREAD_ID="root-thread" \
-    run bash "$TYPES/codex/codex-record-session.sh" team alice /
-  [ "$status" -eq 0 ]
+    run record_role team alice /
+  [ "$status" -eq 2 ]
+  [ "$output" = status=invalid_project ]
   [ -z "$(recorded_uuid team alice)" ]
 }
 
@@ -160,16 +191,28 @@ recorded_project() {
   # /c exists on MSYS (caught by the root check); on POSIX it usually doesn't
   # (caught by -d). Both paths must end in "no record".
   CODEX_THREAD_ID="drive-thread" \
-    run bash "$TYPES/codex/codex-record-session.sh" team alice /c
-  [ "$status" -eq 0 ]
+    run record_role team alice /c
+  [ "$status" -eq 2 ]
+  [ "$output" = status=invalid_project ]
   [ -z "$(recorded_uuid team alice)" ]
 }
 
-@test "codex record: nonexistent project records nothing" {
+@test "codex record: invalid project and canonicalization failure are explicit errors" {
   CODEX_THREAD_ID="ghost-thread" \
-    run bash "$TYPES/codex/codex-record-session.sh" team alice /no/such/dir
-  [ "$status" -eq 0 ]
+    run record_role team alice /no/such/dir
+  [ "$status" -eq 2 ]
+  [ "$output" = status=invalid_project ]
   [ -z "$(recorded_uuid team alice)" ]
+  run env CODEX_THREAD_ID=ghost-thread bash "$TYPES/codex/codex-record-session.sh" team alice ""
+  [ "$status" -eq 2 ]; [ "$output" = status=invalid_project ]
+  local proj; proj="$(mktemp -d)"
+  printf '\nagmsg_canonical_path() { printf ""; }\n' >> "$SCRIPTS/lib/resolve-project.sh"
+  run env CODEX_THREAD_ID=ghost-thread bash "$TYPES/codex/codex-record-session.sh" team alice "$proj"
+  [ "$status" -eq 2 ]; [ "$output" = status=invalid_project ]
+  [ -z "$(recorded_uuid team alice)" ]
+  printf '\nagmsg_canonical_path() { printf "%%s" "$1"; return 1; }\n' >> "$SCRIPTS/lib/resolve-project.sh"
+  run env CODEX_THREAD_ID=ghost-thread bash "$TYPES/codex/codex-record-session.sh" team alice "$proj"
+  [ "$status" -eq 2 ]; [ "$output" = status=invalid_project ]
 }
 
 @test "codex record: symlinked project is recorded in canonical (physical) form" {
@@ -179,18 +222,13 @@ recorded_project() {
   [ -L "$link" ] || skip "ln -s fell back to copy (MSYS default)"
   want="$(cd "$real" && pwd -P)"
   CODEX_THREAD_ID="sym-thread" \
-    bash "$TYPES/codex/codex-record-session.sh" team alice "$link"
+    record_role team alice "$link"
   [ "$(recorded_uuid team alice)" = "sym-thread" ]
   [ "$(recorded_project team alice)" = "$want" ]
 }
 
-# --- codex-record-session.sh: seat from the app-server's loaded set (#579) ---
-#
-# The rollout scan cannot answer "which thread is THIS session" on a project that
-# has been worked in before -- every past session in that cwd matches, so the
-# count is never one and the seat is never written. These cover the replacement:
-# ask the app-server what it has loaded, subtract the threads a role already sits
-# in, and take the remainder only when it is unique.
+# Loaded-thread and rollout histories remain adversarial diagnostic inputs.
+# Without CODEX_THREAD_ID none may infer the caller or activate membership.
 
 # A stand-in for node that ignores the bridge path and its flags and prints the
 # ids the test staged. agmsg_resolve_node honours AGMSG_NODE, so this is the seam
@@ -209,29 +247,26 @@ record_with_loaded() {   # <ids-file> <team> <agent> <project>
   ( unset CODEX_THREAD_ID
     AGMSG_NODE="$(fake_node_printing "$1")" \
     AGMSG_CODEX_BRIDGE_APP_SERVER="ws://127.0.0.1:1" \
-      bash "$TYPES/codex/codex-record-session.sh" "$2" "$3" "$4" )
+      record_role "$2" "$3" "$4" )
 }
 
-@test "codex record: seats the loaded thread that no role has claimed yet" {
+@test "codex record: refuses an unclaimed loaded thread without native identity" {
   local proj ids; proj="$(mktemp -d)"; ids="$TEST_SKILL_DIR/loaded.txt"
   printf 'thr-seated\nthr-unclaimed\n' > "$ids"
   source "$SKILL_DIR/scripts/lib/role-session.sh"
   agmsg_role_session_record team bob thr-seated "$proj" codex
   record_with_loaded "$ids" team alice "$proj"
-  [ "$(recorded_uuid team alice)" = "thr-unclaimed" ]
+  [ -z "$(recorded_uuid team alice)" ]
 }
 
-@test "codex record: a long history in the cwd no longer blocks the seat" {
-  # The exact shape of #579: many past sessions in this project. Under the rollout
-  # scan this is the ambiguous case that records nothing forever; the loaded set
-  # is unaffected by how much history the project has.
+@test "codex record: loaded thread plus long project history does not authorize membership" {
   local proj ids i; proj="$(mktemp -d)"; ids="$TEST_SKILL_DIR/loaded.txt"
   for i in 1 2 3 4 5; do
     make_rollout "hist-uuid-$i" "$proj" "2026/07/05" "2026-07-05T1$i-00-00"
   done
   printf 'thr-live\n' > "$ids"
   record_with_loaded "$ids" team alice "$proj"
-  [ "$(recorded_uuid team alice)" = "thr-live" ]
+  [ -z "$(recorded_uuid team alice)" ]
 }
 
 @test "codex record: two unclaimed loaded threads record nothing (stays fail-closed)" {
@@ -251,7 +286,7 @@ record_with_loaded() {   # <ids-file> <team> <agent> <project>
   [ -z "$(recorded_uuid team alice)" ]
 }
 
-@test "codex record: a claimed thread of another TYPE is not subtracted" {
+@test "codex record: other-runtime history cannot authorize a Codex membership" {
   # claude-code records session ids in the same directory. Subtracting those
   # would silently shrink the codex candidate set and could make an ambiguous
   # pair look unique -- the one way this subtraction could seat a wrong thread.
@@ -292,14 +327,14 @@ fake_node_failing() {
   [ -z "$(recorded_uuid team alice)" ]
 }
 
-@test "codex record: an unreachable app-server DOES fall back to the rollout scan" {
+@test "codex record: unreachable app-server cannot enable rollout inference" {
   local proj; proj="$(mktemp -d)"
   make_rollout "rollout-unique-uuid" "$proj"
   ( unset CODEX_THREAD_ID
     AGMSG_NODE="$(fake_node_failing)" \
     AGMSG_CODEX_BRIDGE_APP_SERVER="ws://127.0.0.1:1" \
-      bash "$TYPES/codex/codex-record-session.sh" team alice "$proj" )
-  [ "$(recorded_uuid team alice)" = "rollout-unique-uuid" ]
+      record_role team alice "$proj" )
+  [ -z "$(recorded_uuid team alice)" ]
 }
 
 @test "codex record: a role that already has a seat is never re-seated by inference" {
@@ -314,24 +349,23 @@ fake_node_failing() {
   [ "$(recorded_uuid team alice)" = "thread-A" ]
 }
 
-@test "codex record: an unseated role still gets the remainder while a seated one keeps its own" {
+@test "codex record: an unseated role never adopts the loaded remainder" {
   local proj ids; proj="$(mktemp -d)"; ids="$TEST_SKILL_DIR/loaded.txt"
   printf 'thread-A\nthread-B\n' > "$ids"
   source "$SKILL_DIR/scripts/lib/role-session.sh"
   agmsg_role_session_record team alice thread-A "$proj" codex
   record_with_loaded "$ids" team bob "$proj"
-  [ "$(recorded_uuid team bob)" = "thread-B" ]
+  [ -z "$(recorded_uuid team bob)" ]
   [ "$(recorded_uuid team alice)" = "thread-A" ]
 }
 
-@test "codex record: CODEX_THREAD_ID still re-seats a seated role (bridge write-back)" {
-  # The guard above is for INFERENCE only. The bridge rewrites the seat after
-  # arming with a thread the app-server confirmed, which must still land.
+@test "codex record: explicit CODEX_THREAD_ID replaces advisory history" {
+  # Existing advisory history must not prevent a fresh explicit claim.
   local proj; proj="$(mktemp -d)"
   source "$SKILL_DIR/scripts/lib/role-session.sh"
   agmsg_role_session_record team alice guessed-thread "$proj" codex
   CODEX_THREAD_ID="confirmed-thread" \
-    bash "$TYPES/codex/codex-record-session.sh" team alice "$proj"
+    record_role team alice "$proj"
   [ "$(recorded_uuid team alice)" = "confirmed-thread" ]
 }
 
@@ -344,17 +378,11 @@ fake_node_failing() {
   source "$SKILL_DIR/scripts/lib/role-session.sh"
   agmsg_role_session_record team alice thread-A "$proj" codex
   ( unset CODEX_THREAD_ID AGMSG_CODEX_BRIDGE_APP_SERVER
-    bash "$TYPES/codex/codex-record-session.sh" team alice "$proj" )
+    record_role team alice "$proj" )
   [ "$(recorded_uuid team alice)" = "thread-A" ]
 }
 
-# --- seating without the app-server environment variable (#583 follow-up) ---
-#
-# The variable does not arrive on the path #579 is about. Under codex 0.146
-# `--remote` this script runs inside the app-server process, and codex-monitor.sh
-# cannot export into that context: the URL does not exist until the server's
-# banner has been parsed, which is after the server is running. The port file
-# carries the same string, so seating has to work from it alone.
+# Port-file discovery is a transport detail, never native session identity.
 
 record_with_loaded_via_port_file() {   # <ids-file> <team> <agent> <project>
   local hash
@@ -365,16 +393,16 @@ record_with_loaded_via_port_file() {   # <ids-file> <team> <agent> <project>
   printf '1' > "$TEST_SKILL_DIR/run/codex-app-server.$hash.port"
   ( unset CODEX_THREAD_ID AGMSG_CODEX_BRIDGE_APP_SERVER
     AGMSG_NODE="$(fake_node_printing "$1")" \
-      bash "$TYPES/codex/codex-record-session.sh" "$2" "$3" "$4" )
+      record_role "$2" "$3" "$4" )
 }
 
-@test "codex record: seats from the port file when the app-server variable never arrives" {
+@test "codex record: a port file cannot establish native session identity" {
   local proj ids; proj="$(mktemp -d)"; ids="$TEST_SKILL_DIR/loaded.txt"
   printf 'thr-seated\nthr-unclaimed\n' > "$ids"
   source "$SKILL_DIR/scripts/lib/role-session.sh"
   agmsg_role_session_record team bob thr-seated "$proj" codex
   record_with_loaded_via_port_file "$ids" team alice "$proj"
-  [ "$(recorded_uuid team alice)" = "thr-unclaimed" ]
+  [ -z "$(recorded_uuid team alice)" ]
 }
 
 @test "codex record: no port file and no variable records nothing, it does not guess" {
@@ -384,11 +412,11 @@ record_with_loaded_via_port_file() {   # <ids-file> <team> <agent> <project>
   printf 'thr-unclaimed\n' > "$ids"
   ( unset CODEX_THREAD_ID AGMSG_CODEX_BRIDGE_APP_SERVER
     AGMSG_NODE="$(fake_node_printing "$ids")" \
-      bash "$TYPES/codex/codex-record-session.sh" team alice "$proj" )
+      record_role team alice "$proj" )
   [ -z "$(recorded_uuid team alice)" ]
 }
 
-@test "codex record: a half-written port file is not turned into a URL" {
+@test "codex record: half-written port file cannot establish native identity" {
   local proj ids hash; proj="$(mktemp -d)"; ids="$TEST_SKILL_DIR/loaded.txt"
   printf 'thr-unclaimed\n' > "$ids"
   # shellcheck disable=SC1091
@@ -398,11 +426,11 @@ record_with_loaded_via_port_file() {   # <ids-file> <team> <agent> <project>
   printf 'not-a-port' > "$TEST_SKILL_DIR/run/codex-app-server.$hash.port"
   ( unset CODEX_THREAD_ID AGMSG_CODEX_BRIDGE_APP_SERVER
     AGMSG_NODE="$(fake_node_printing "$ids")" \
-      bash "$TYPES/codex/codex-record-session.sh" team alice "$proj" )
+      record_role team alice "$proj" )
   [ -z "$(recorded_uuid team alice)" ]
 }
 
-@test "codex record: a digits-only value outside the port range is not turned into a URL" {
+@test "codex record: neither valid nor invalid port values establish native identity" {
   # Digits alone do not make a port. A prefix of a real port is also all digits,
   # which is why the writer publishes atomically — this bounds what anything
   # else could leave behind.
@@ -417,13 +445,13 @@ record_with_loaded_via_port_file() {   # <ids-file> <team> <agent> <project>
     printf '%s' "$bad" > "$TEST_SKILL_DIR/run/codex-app-server.$hash.port"
     ( unset CODEX_THREAD_ID AGMSG_CODEX_BRIDGE_APP_SERVER
       AGMSG_NODE="$(fake_node_printing "$ids")" \
-        bash "$TYPES/codex/codex-record-session.sh" team alice "$proj" )
+        record_role team alice "$proj" )
     [ -z "$(recorded_uuid team alice)" ] || { echo "seated from port '$bad'"; false; }
   done
-  # …and the boundary values that ARE ports still work.
+  # Valid port values also cannot identify the current native session.
   printf '65535' > "$TEST_SKILL_DIR/run/codex-app-server.$hash.port"
   ( unset CODEX_THREAD_ID AGMSG_CODEX_BRIDGE_APP_SERVER
     AGMSG_NODE="$(fake_node_printing "$ids")" \
-      bash "$TYPES/codex/codex-record-session.sh" team alice "$proj" )
-  [ "$(recorded_uuid team alice)" = "thr-unclaimed" ]
+      record_role team alice "$proj" )
+  [ -z "$(recorded_uuid team alice)" ]
 }

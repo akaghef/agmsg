@@ -6,6 +6,8 @@
 
 : "${SKILL_DIR:?subscription.sh requires SKILL_DIR}"
 
+. "$SKILL_DIR/scripts/lib/role-session.sh"
+
 agmsg_sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
 
 # Resolve the (team, agent) rows this process should receive for.
@@ -36,6 +38,29 @@ agmsg_subscription_pairs() {
   local team agent
   while IFS=$'\t' read -r team agent; do
     [ -z "$team" ] && continue
+    # Claude/Codex delivery is opt-in for this native session. A role filter
+    # narrows an existing membership; it never implicitly creates one.
+    case "$type" in
+      claude-code|codex)
+        local native="$owner_id" canonical
+        if [ "$type" = codex ]; then
+          native="${CODEX_THREAD_ID:-}"
+        else
+          native="$(agmsg_instance_bare_sid "$owner_id")"
+        fi
+        canonical="$(agmsg_canonical_path "$project")"
+        if agmsg_role_active_matches "$team" "$agent" "$type" "$native" "$canonical" "$owner_id"; then
+          filtered="${filtered:+$filtered$'\n'}${team}"$'\t'"${agent}"
+          continue
+        fi
+        # Preserve held-role diagnostics without making a free/unclaimed role
+        # eligible. The legacy branch below only handles the other-owner case.
+        case "$(actas_lock_state "$team" "$agent" "$owner_id")" in
+          other:*) ;;
+          *) continue ;;
+        esac
+        ;;
+    esac
     state=$(actas_lock_state "$team" "$agent" "$owner_id")
     case "$state" in
       other:*)
@@ -59,6 +84,9 @@ agmsg_subscription_pairs() {
         ;;
     esac
 
+    # Never fall through to legacy claiming after an ACTIVE mismatch, even
+    # when ownership changed between the diagnostic state reads above.
+    case "$type" in claude-code|codex) continue ;; esac
     if [ -n "$active_name" ] && [ "$claim_mode" = "claim" ]; then
       result=$(actas_lock_claim "$team" "$agent" "$owner_id" 2>/dev/null || true)
       case "$result" in

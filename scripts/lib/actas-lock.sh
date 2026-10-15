@@ -60,6 +60,13 @@ actas_lock_path() {
   printf '%s/actas.%s__%s.session' "$(_actas_lock_dir)" "$t" "$a"
 }
 
+# All owner mutations share the ACTIVE membership guard. Dynamic scoping lets
+# role-session's active transaction call these primitives while holding it.
+_actas_guard_for_path() {
+  local lock="$1" suffix="${1##*/actas.}"
+  printf '%s/role-active.%s.guard' "${lock%/*}" "${suffix%.session}"
+}
+
 # Readiness sentinel path for (team, agent). watch.sh creates this when an
 # exclusive (actas) watcher attaches and removes it on exit, so the file is
 # present iff a live watcher is currently receiving for that role. `spawn`
@@ -97,6 +104,23 @@ actas_lock_owner() {
 # so existing callers (gc_stale, watch.sh subscription, session-start GC) need
 # no change. Empty token → not alive.
 actas_lock_sid_alive() {
+  # Desktop threads have no process-liveness token. Explicit membership keeps
+  # their lock live until matching leave/session-end; GC must not infer death.
+  local active line active_owner active_type active_lock
+  for active in "$(_actas_lock_dir)"/role-active.*; do
+    [ -f "$active" ] || continue
+    active_owner=""; active_type=""
+    while IFS= read -r line; do
+      case "$line" in
+        owner=*) active_owner="${line#owner=}" ;;
+        type=*) active_type="${line#type=}" ;;
+      esac
+    done < "$active"
+    if [ "$active_type" = codex ] && [ "$active_owner" = "$1" ]; then
+      active_lock="$(_actas_lock_dir)/actas.${active##*/role-active.}.session"
+      [ "$(head -1 "$active_lock" 2>/dev/null || true)" != "$active_owner" ] || return 0
+    fi
+  done
   agmsg_instance_alive "$1"
 }
 
@@ -137,7 +161,7 @@ _actas_lock_try_claim() {
 # Exit codes:
 #   0  — claimed (now owned by this sid, was already ours, or stale-replaced).
 #   1  — held by another live session. Stdout: "held:<other_sid>".
-actas_lock_claim() {
+_actas_lock_claim_unlocked() {
   local team="$1" agent="$2" sid="$3"
   local attempts=0 result lock_path reclaim_dir _owner
   lock_path="$(actas_lock_path "$team" "$agent")"
@@ -182,43 +206,80 @@ actas_lock_claim() {
   return 1
 }
 
+actas_lock_claim() (
+  local guard rc=0
+  guard="$(_actas_guard_for_path "$(actas_lock_path "$1" "$2")")"
+  mkdir -p "$(_actas_lock_dir)" || return 1
+  if [ "${_AGMSG_HELD_ROLE_GUARD:-}" != "$guard" ]; then
+    mkdir "$guard" 2>/dev/null || return 1
+    trap 'rmdir "$guard" 2>/dev/null || true' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+  fi
+  _actas_lock_claim_unlocked "$@" || rc=$?
+  return "$rc"
+)
+
 # Release a lock if we own it. Idempotent.
-actas_lock_release() {
-  local team="$1" agent="$2" sid="$3"
-  local lock owner
+actas_lock_release() (
+  local team="$1" agent="$2" sid="$3" lock owner guard
   lock="$(actas_lock_path "$team" "$agent")"
   [ -f "$lock" ] || return 0
+  guard="$(_actas_guard_for_path "$lock")"
+  if [ "${_AGMSG_HELD_ROLE_GUARD:-}" != "$guard" ]; then
+    mkdir "$guard" 2>/dev/null || return 1
+    trap 'rmdir "$guard" 2>/dev/null || true' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+  fi
   owner="$(actas_lock_owner "$team" "$agent")"
-  [ "$owner" = "$sid" ] && rm -f "$lock"
+  [ "$owner" != "$sid" ] || rm -f "$lock"
   return 0
-}
+)
 
-# Release every lock currently owned by the given session_id. Used by
-# session-end.sh when a CC session exits.
+# One bulk-cleanup transaction per path. EXIT performs the only removal of our
+# guard; a second cleanup after rmdir could delete a successor's newly acquired
+# guard. Owner checks occur under the same guard as claim/publication.
+_actas_lock_remove_matching_path() (
+  local lock="$1" mode="$2" sid="${3:-}" guard owner
+  guard="$(_actas_guard_for_path "$lock")"
+  mkdir "$guard" 2>/dev/null || return 1
+  trap 'rmdir "$guard" 2>/dev/null || true' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  [ -f "$lock" ] || return 1
+  owner="$(head -1 "$lock" 2>/dev/null || true)"
+  if [ "$mode" = owner ]; then
+    [ "$owner" = "$sid" ] || return 1
+  else
+    { [ -z "$owner" ] || ! actas_lock_sid_alive "$owner"; } || return 1
+  fi
+  rm -f "$lock"
+)
+
+# Release every lock currently owned by this instance, never a successor.
 actas_lock_release_all() {
-  local sid="$1"
-  local dir; dir="$(_actas_lock_dir)"
+  local sid="$1" dir f
+  dir="$(_actas_lock_dir)"
   [ -d "$dir" ] || return 0
-  local f owner
   for f in "$dir"/actas.*.session; do
     [ -f "$f" ] || continue
-    owner="$(head -1 "$f" 2>/dev/null || true)"
-    [ "$owner" = "$sid" ] && rm -f "$f"
+    _actas_lock_remove_matching_path "$f" owner "$sid" || true
   done
   return 0
 }
 
-# Garbage-collect locks whose owner session_id is no longer alive.
-# Returns the number of locks reclaimed on stdout (for observability).
+# Garbage-collect only locks still stale inside their membership transaction.
 actas_lock_gc_stale() {
-  local dir; dir="$(_actas_lock_dir)"
+  local dir f count=0
+  dir="$(_actas_lock_dir)"
   [ -d "$dir" ] || { echo 0; return 0; }
-  local f owner count=0
   for f in "$dir"/actas.*.session; do
     [ -f "$f" ] || continue
-    owner="$(head -1 "$f" 2>/dev/null || true)"
-    if [ -z "$owner" ] || ! actas_lock_sid_alive "$owner"; then
-      rm -f "$f"
+    if _actas_lock_remove_matching_path "$f" stale; then
       count=$((count + 1))
     fi
   done

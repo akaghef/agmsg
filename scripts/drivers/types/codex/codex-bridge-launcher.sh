@@ -12,14 +12,10 @@ set -euo pipefail
 # green. See scripts/lib/close-fds.sh.
 exec 3>&- 4>&-
 
-# Runs outside Codex's tool sandbox and owns the app-server connections. The
-# dispatcher starts one bridge per recorded Codex role in this project.
-#
-# On codex 0.141+ the SessionStart hook cannot resolve the thread id
-# (CODEX_THREAD_ID is not exported and no rollout is written for --remote
-# sessions), so the bridge discovers the live TUI thread itself via
-# thread/loaded/list (`--thread loaded`). If an older codex DID write a request
-# file with a real thread id, that id is used instead. See #170, #41.
+# Runs outside Codex's tool sandbox and owns the app-server or Desktop IPC
+# connection. Each bridge targets exactly the native thread named by a role's
+# explicit ACTIVE membership. Historical resume records and loaded-thread
+# discovery cannot opt another session into delivery.
 
 TYPE="${1:?Usage: codex-bridge-launcher.sh <type> <project_path> <app_server> <parent_pid>}"
 PROJECT="${2:?Missing project_path}"
@@ -59,8 +55,7 @@ source "$SCRIPT_DIR/../../../lib/storage.sh"
 STORAGE_DIR="$(agmsg_storage_dir)"
 TAB="$(printf '\t')"
 
-# role-session record (#350): the bridge prefers this role's RECORDED codex thread
-# over the app-server's "loaded" thread (see the thread-resolution block below).
+# Shared role-session library also owns explicit ACTIVE membership records.
 # shellcheck source=../../../lib/role-session.sh
 source "$SCRIPT_DIR/../../../lib/role-session.sh"
 # shellcheck source=../../../lib/resolve-project.sh
@@ -75,7 +70,11 @@ mkdir -p "$RUN_DIR"
 # role-child lifetime to that shared process rather than whichever TUI happened
 # to start first. Tests/older launchers without the sidecar retain parent-PID
 # fallback behavior.
-LIFETIME_PID="$(cat "$SERVER_PID_FILE" 2>/dev/null || true)"
+LIFETIME_PID=""
+case "$APP_SERVER" in
+  desktop://*) ;; # A Desktop owner never inherits an unrelated TUI lifetime.
+  *) LIFETIME_PID="$(cat "$SERVER_PID_FILE" 2>/dev/null || true)" ;;
+esac
 if [ -z "$LIFETIME_PID" ] || ! _agmsg_pid_alive_local "$LIFETIME_PID"; then
   LIFETIME_PID="$PARENT_PID"
 fi
@@ -224,17 +223,15 @@ poll_sleep() {
   return 0
 }
 
-# Any change here can change the safe subscription set. Include the request
-# thread plus each role's recorded session/project, not merely registrations:
-# actas/resume rewrites a role record without changing identities.sh output.
+# Any change here can change the safe subscription set. Include each role's
+# ACTIVE native session/owner/project/type, not merely registrations: explicit
+# actas/leave changes membership without necessarily changing the roster.
 # $1 is this tick's already-resolved identity list. It is passed in rather than
 # re-resolved so one iteration runs identities.sh once, not twice.
 #
 # Assigns to SAFETY_STATE instead of printing, and reads the roles with a
 # herestring rather than a pipeline, so the whole thing runs in the caller's
-# shell. Both matter: agmsg_role_session_load memoizes the record path, and a
-# memo written inside a command substitution or a pipeline subshell is
-# discarded the moment it is useful.
+# shell, so the shared role-library path cache survives between polls.
 build_safety_state() {
   local identity="$1"
   local request="" team name
@@ -244,8 +241,8 @@ build_safety_state() {
   SAFETY_STATE="request=$request"
   while IFS="$TAB" read -r team name; do
     [ -n "$team" ] || continue
-    agmsg_role_session_load "$team" "$name" 2>/dev/null || true
-    SAFETY_STATE="$SAFETY_STATE"$'\n'"$team$TAB$name$TAB$AGMSG_ROLE_SESSION_UUID$TAB$AGMSG_ROLE_SESSION_PROJECT"
+    agmsg_role_active_load "$team" "$name" 2>/dev/null || true
+    SAFETY_STATE="$SAFETY_STATE"$'\n'"$team$TAB$name$TAB$AGMSG_ROLE_ACTIVE_SESSION$TAB$AGMSG_ROLE_ACTIVE_PROJECT$TAB$AGMSG_ROLE_ACTIVE_TYPE$TAB$AGMSG_ROLE_ACTIVE_OWNER"
   done <<< "$identity"
 }
 
@@ -313,33 +310,21 @@ done
 build_safety_state "$ids"
 safety_state="$SAFETY_STATE"
 
-# Safety over delivery (#150): a role-session record identifies the thread that
-# owns a role. Never inject that role's inbox into a different live TUI. Roles
-# without a record may share the current project TUI. If the hook could not
-# provide a concrete live thread (`loaded`), recorded roles are conservatively
-# left unsubscribed rather than guessed. They remain unread for their proper
-# next SessionStart.
-thread_hint="loaded"
-if [ -f "$REQUEST_FILE" ]; then
-  _hint_type=""; _hint_thread=""; _hint_app=""
-  IFS="$TAB" read -r _hint_type _hint_thread _hint_app < "$REQUEST_FILE" 2>/dev/null || true
-  [ -n "${_hint_thread:-}" ] && thread_hint="$_hint_thread"
-fi
+# Only explicit ACTIVE membership can nominate a native recipient.
+# Historical resume records and project request hints never authorize delivery.
 safe_ids=""
-raw_identity_count="$(printf '%s\n' "$ids" | grep -c . || true)"
 while IFS="$TAB" read -r candidate_team candidate_name; do
   [ -n "$candidate_team" ] || continue
   # This loop runs in the launcher's own shell (herestring, not a pipeline), so
   # it is also what warms the record-path memo for the rest of the process.
-  agmsg_role_session_load "$candidate_team" "$candidate_name" 2>/dev/null || true
-  candidate_thread="$AGMSG_ROLE_SESSION_UUID"
+  agmsg_role_active_load "$candidate_team" "$candidate_name" 2>/dev/null || true
+  [ "$AGMSG_ROLE_ACTIVE_TYPE" = "$TYPE" ] || continue
+  candidate_thread="$AGMSG_ROLE_ACTIVE_SESSION"
+  [ "$AGMSG_ROLE_ACTIVE_OWNER" = "$candidate_thread" ] || continue
   if [ -n "$candidate_thread" ]; then
-    candidate_project="$AGMSG_ROLE_SESSION_PROJECT"
+    candidate_project="$AGMSG_ROLE_ACTIVE_PROJECT"
     candidate_project_phys="$(agmsg_canonical_path "$candidate_project" 2>/dev/null || printf '%s' "$candidate_project")"
-    # A record for another project proves this role's current seat is elsewhere:
-    # never consume its unread rows from this project. A lone same-project role keeps #350's legacy recorded-thread affinity even
-    # before a concrete request thread is available; multiplexed roles require
-    # proof and are excluded while the hint is only `loaded`.
+    # A membership for another project cannot authorize this launcher.
     if [ "$candidate_project_phys" != "$PROJECT_PHYS" ]; then
       continue
     fi
@@ -447,7 +432,10 @@ while _agmsg_pid_alive_local "$PARENT_PID"; do
     _rtype=""; _rthread=""; _rapp=""
     IFS="$TAB" read -r _rtype _rthread _rapp < "$REQUEST_FILE" 2>/dev/null || true
     [ -n "${_rthread:-}" ] && thread_id="$_rthread"
-    [ -n "${_rapp:-}" ] && req_app_server="$_rapp"
+    case "$APP_SERVER" in
+      desktop://*) ;; # Project TUI hints cannot change the native Desktop route.
+      *) [ -n "${_rapp:-}" ] && req_app_server="$_rapp" ;;
+    esac
   fi
 
   # A child launcher is role-scoped. The project request file only supplies a
@@ -456,11 +444,11 @@ while _agmsg_pid_alive_local "$PARENT_PID"; do
   IFS="$TAB" read -r team name <<EOF
 $ids
 EOF
-  agmsg_role_session_load "$team" "$name" 2>/dev/null || true
-  rec_thread="$AGMSG_ROLE_SESSION_UUID"
-  rec_project="$AGMSG_ROLE_SESSION_PROJECT"
+  agmsg_role_active_load "$team" "$name" 2>/dev/null || true
+  rec_thread="$AGMSG_ROLE_ACTIVE_SESSION"
+  rec_project="$AGMSG_ROLE_ACTIVE_PROJECT"
   rec_project_phys="$(agmsg_canonical_path "$rec_project" 2>/dev/null || printf '%s' "$rec_project")"
-  if [ -z "$rec_thread" ] || [ "$rec_project_phys" != "$PROJECT_PHYS" ]; then
+  if [ -z "$rec_thread" ] || [ "$AGMSG_ROLE_ACTIVE_OWNER" != "$rec_thread" ] || [ "$AGMSG_ROLE_ACTIVE_TYPE" != "$TYPE" ] || [ "$rec_project_phys" != "$PROJECT_PHYS" ]; then
     # A role with no record (or one seated in another project) stays
     # deliberately unsubscribed (#150) and waits for a record to appear. That
     # wait is open-ended, so it has to be the cheapest path in the file.
@@ -469,7 +457,8 @@ EOF
   fi
   thread_id="$rec_thread"
 
-  # The role-session record is the sole thread authority (#150 phase 2/#350).
+  # ACTIVE membership is the sole thread authority; historical resume records
+  # never opt a session into delivery.
 
   if [ -f "$pidfile" ]; then
     bridge_pid=""
@@ -500,6 +489,11 @@ EOF
     fi
   fi
 
+  transport_args=(--app-server "$req_app_server")
+  case "$req_app_server" in
+    desktop://*) transport_args=(--desktop-ipc "${req_app_server#desktop://}") ;;
+  esac
+
   nohup "${bridge_run[@]}" \
     --project "$PROJECT" \
     --workspace-root "$STORAGE_DIR" \
@@ -508,7 +502,7 @@ EOF
     --type "$TYPE" \
     "${bridge_pairs[@]}" \
     --thread "$thread_id" \
-    --app-server "$req_app_server" \
+    "${transport_args[@]}" \
     --inline-inbox \
     >>"$log" 2>&1 3>&- 4>&- &
   launched_pid=$!

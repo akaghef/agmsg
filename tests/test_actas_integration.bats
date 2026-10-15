@@ -23,6 +23,7 @@ setup() {
   # Source the lib so we can call its functions directly from the test body.
   # shellcheck disable=SC1090
   source "$SKILL_DIR/scripts/lib/actas-lock.sh"
+  source "$SKILL_DIR/scripts/lib/role-session.sh"
 }
 
 teardown() { teardown_test_env; }
@@ -122,8 +123,10 @@ fake_session() {
 @test "session-start: GCs stale locks (owner sid no longer alive)" {
   # Stale lock — owner sid has no cc-instance.
   echo "sid-ghost" > "$(actas_lock_path T alice)"
-  # Need an identity so session-start doesn't short-circuit.
+  # Bind a different role so startup reaches GC while alice stays stale.
   fake_register T alice
+  fake_register T bob
+  agmsg_role_active_claim T bob sid-current /tmp/p1 claude-code sid-current
   echo "sid-current" > "$RUN_DIR/cc-instance.$$"
 
   printf '{"session_id":"sid-current"}' \
@@ -135,56 +138,45 @@ fake_session() {
 # --- watch.sh subscription exclusion ---
 # Run watch.sh briefly and inspect its stderr for the exclusion message.
 
-@test "watch: excludes pairs held by another live session (stderr message)" {
-  skip_on_windows "actas watcher liveness under Git Bash (#182)"
+@test "watch: unbound session leaves another owner's mail unread" {
   fake_register T alice
   fake_register T bob
   fake_session "sid-other" >/dev/null
-  # Lock alice for sid-other (this test process pretends to be sid-other).
-  echo "sid-other" > "$(actas_lock_path T alice)"
+  agmsg_role_active_claim T alice sid-other /tmp/p1 claude-code sid-other
+  bash "$SKILL_DIR/scripts/send.sh" T bob alice "for the owner" >/dev/null
 
-  # Run watch.sh in background with a tiny interval, capture stderr quickly.
-  AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" "sid-mine" /tmp/p1 claude-code \
-    >/dev/null 2> "$BATS_TEST_TMPDIR/watch.err" 3>&- &
-  local wpid=$!
-  # Give it just enough time to resolve subscription and print stderr.
-  sleep 1
-  kill "$wpid" 2>/dev/null || true
-  wait "$wpid" 2>/dev/null || true
-
-  run cat "$BATS_TEST_TMPDIR/watch.err"
-  [[ "$output" =~ "skipping pairs held by other sessions" ]]
-  [[ "$output" =~ "T/alice" ]]
+  run env AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" sid-mine /tmp/p1 claude-code
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no available identities"* ]] || return 1
+  [[ "$output" == *"skipping pairs held by other sessions"* ]] || return 1
+  [[ "$output" == *"T/alice"* ]] || return 1
+  [[ "$output" != *"for the owner"* ]] || return 1
+  [ "$(actas_lock_owner T alice)" = sid-other ]
+  source "$SKILL_DIR/scripts/lib/storage.sh"
+  agmsg_storage_load
+  [ "$(storage_list_unread T alice | grep -c .)" -eq 1 ]
 }
 
-@test "watch: with active_name held by other session, exits with held error" {
-  skip_on_windows "actas watcher liveness under Git Bash (#182)"
+@test "watch: active_name cannot claim another session's active role" {
   fake_register T alice
-  fake_session "sid-other" >/dev/null
-  echo "sid-other" > "$(actas_lock_path T alice)"
+  fake_session sid-other >/dev/null
+  agmsg_role_active_claim T alice sid-other /tmp/p1 claude-code sid-other
 
-  run env AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" "sid-mine" /tmp/p1 claude-code alice
+  run env AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" sid-mine /tmp/p1 claude-code alice
   [ "$status" -eq 1 ]
-  [[ "$output" =~ "cannot claim" ]]
-  [[ "$output" =~ "T/alice" ]]
-  # Lock was not stolen.
-  [ "$(actas_lock_owner T alice)" = "sid-other" ]
+  [[ "$output" == *"cannot claim"* ]] || return 1
+  [[ "$output" == *"T/alice"* ]] || return 1
+  [ "$(actas_lock_owner T alice)" = sid-other ]
 }
 
-@test "watch: with active_name on a free pair, claims and continues" {
-  skip_on_windows "actas watcher process mgmt under Git Bash (#182)"
+@test "watch: active_name alone does not activate a free role" {
   fake_register T alice
 
-  AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" "sid-me" /tmp/p1 claude-code alice \
-    >/dev/null 2> "$BATS_TEST_TMPDIR/watch.err" 3>&- &
-  local wpid=$!
-  sleep 1
-
-  # Should now own the lock.
-  [ "$(actas_lock_owner T alice)" = "sid-me" ]
-
-  kill "$wpid" 2>/dev/null || true
-  wait "$wpid" 2>/dev/null || true
+  run env AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" sid-me /tmp/p1 claude-code alice
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"nothing to do"* ]] || return 1
+  [ -z "$(actas_lock_owner T alice)" ]
+  refute test -f "$RUN_DIR/ready.T__alice"
 }
 
 # --- watch.sh releasing a pair it no longer owns (#683) ---
@@ -205,14 +197,13 @@ fake_session() {
   fake_register T alice
   fake_register T bob
 
+  agmsg_role_active_claim T alice sid-old /tmp/p1 claude-code sid-old
   AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" "sid-old" /tmp/p1 claude-code alice \
     > "$BATS_TEST_TMPDIR/old.out" 2> "$BATS_TEST_TMPDIR/old.err" 3>&- &
   local old=$!
-  local i
-  for i in $(seq 1 50); do
-    [ "$(actas_lock_owner T alice)" = "sid-old" ] && break
-    sleep 0.1
-  done
+  # The explicit claim predates launch. Readiness, not that preexisting lock,
+  # proves the watcher subscribed before this test transfers the role.
+  wait_for_file "$RUN_DIR/ready.T__alice"
   [ "$(actas_lock_owner T alice)" = "sid-old" ]
 
   # A second session takes the role — what `/agmsg actas` does from a new
@@ -239,8 +230,7 @@ fake_session() {
   # And it must say why. Exiting silently is the same defect class -- this
   # watcher's stderr is the only place a reason can survive.
   run cat "$BATS_TEST_TMPDIR/old.err"
-  [[ "$output" == *"T/alice"* ]]
-  [[ "$output" == *"sid-new"* ]]
+  [[ "$output" == *"active membership ended"* ]] || return 1
 
   # The message is still unread, so the session that now owns the role is
   # offered it. Without this, "did not print it" would also pass for a watcher
@@ -257,150 +247,80 @@ fake_session() {
   wait "$old" 2>/dev/null || true
 }
 
-# The other half, and the one that decides whether this fix is safe: a watcher
-# with a BROAD subscription serves several roles, so a role moving elsewhere
-# must cost it that role and nothing else. Exiting here would take down a whole
-# session's delivery because one member ran `actas` somewhere -- a worse failure
-# than the one being fixed.
-@test "watch: a broad watcher drops only the claimed pair and keeps serving the rest (#683)" {
+# Losing one explicitly bound role must not interrupt another role owned by
+# the same session. An unclaimed role never falls back to project delivery.
+@test "watch: losing one active role keeps delivery for its other active role (#683)" {
   skip_on_windows "actas watcher process mgmt under Git Bash (#182)"
   fake_register T alice
   fake_register T bob
   fake_register T carol
+  agmsg_role_active_claim T alice sid-broad /tmp/p1 claude-code sid-broad
+  agmsg_role_active_claim T bob sid-broad /tmp/p1 claude-code sid-broad
 
-  AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" "sid-broad" /tmp/p1 claude-code \
+  AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" sid-broad /tmp/p1 claude-code \
     > "$BATS_TEST_TMPDIR/broad.out" 2> "$BATS_TEST_TMPDIR/broad.err" 3>&- &
   local broad=$!
-  sleep 1
-
-  sleep 60 &
-  local newpid=$!
-  echo "sid-new" > "$RUN_DIR/cc-instance.$newpid"
-  echo "sid-new" > "$(actas_lock_path T alice)"
-
-  bash "$SKILL_DIR/scripts/send.sh" T carol alice "for the role that moved" >/dev/null
-  bash "$SKILL_DIR/scripts/send.sh" T carol bob   "for the role that stayed" >/dev/null
-  sleep 4
-  kill "$newpid" 2>/dev/null || true
-
-  # Still running — this is the assertion the fix has to earn.
+  wait_for_file "$RUN_DIR/watch.sid-broad.pid"
+  # Wait for delivery to establish that both startup membership records were
+  # loaded before releasing one; a pidfile predates subscription resolution.
+  bash "$SKILL_DIR/scripts/send.sh" T carol alice "before release" >/dev/null
+  wait_for_file_contains "$BATS_TEST_TMPDIR/broad.out" "before release"
+  agmsg_role_active_release T alice claude-code sid-broad sid-broad
+  bash "$SKILL_DIR/scripts/send.sh" T carol alice "for the released role" >/dev/null
+  bash "$SKILL_DIR/scripts/send.sh" T carol bob "for the role that stayed" >/dev/null
+  wait_for_file_contains "$BATS_TEST_TMPDIR/broad.out" "for the role that stayed"
   kill -0 "$broad" 2>/dev/null
-
-  run cat "$BATS_TEST_TMPDIR/broad.out"
-  [[ "$output" == *"for the role that stayed"* ]]
-  [[ "$output" != *"for the role that moved"* ]]
-
-  # And it said which pair it gave up.
-  run cat "$BATS_TEST_TMPDIR/broad.err"
-  [[ "$output" == *"T/alice"* ]]
-
+  refute grep -q "for the released role" "$BATS_TEST_TMPDIR/broad.out"
+  source "$SKILL_DIR/scripts/lib/storage.sh"
+  agmsg_storage_load
+  [ "$(storage_list_unread T alice | grep -c .)" -eq 1 ]
   kill "$broad" 2>/dev/null || true
   wait "$broad" 2>/dev/null || true
 }
 
-# Stepping aside is for as long as someone else holds the role, not forever.
-# The review of the first version caught the opposite claim in my own
-# description: the pair stays in the subscription and comes back when the lock
-# reads free again. Permanence would be the worse behaviour -- the role is still
-# registered to this project, so nobody would deliver for it until the session
-# restarted -- so this pins the return rather than the drop.
-@test "watch: a broad watcher takes a pair back once nobody holds it (#683)" {
+@test "watch: released role remains unread until explicitly reclaimed (#683)" {
   skip_on_windows "actas watcher process mgmt under Git Bash (#182)"
   fake_register T alice
   fake_register T carol
-
-  AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" "sid-broad" /tmp/p1 claude-code \
+  agmsg_role_active_claim T alice sid-broad /tmp/p1 claude-code sid-broad
+  AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" sid-broad /tmp/p1 claude-code \
     > "$BATS_TEST_TMPDIR/broad.out" 2> "$BATS_TEST_TMPDIR/broad.err" 3>&- &
   local broad=$!
-  sleep 1
-
-  sleep 60 &
-  local newpid=$!
-  echo "sid-new" > "$RUN_DIR/cc-instance.$newpid"
-  echo "sid-new" > "$(actas_lock_path T alice)"
-  sleep 2
-
-  # It stepped aside while the other session was live.
-  bash "$SKILL_DIR/scripts/send.sh" T carol alice "while it was held" >/dev/null
-  sleep 2
-  run cat "$BATS_TEST_TMPDIR/broad.out"
-  [[ "$output" != *"while it was held"* ]]
-
-  # The holder disappears. The lock file stays behind — a stale owner reads as
-  # free, which is exactly the state the startup filter already treats as
-  # available.
-  kill "$newpid" 2>/dev/null || true
-  wait "$newpid" 2>/dev/null || true
-  rm -f "$RUN_DIR/cc-instance.$newpid"
+  bash "$SKILL_DIR/scripts/send.sh" T carol alice "before release" >/dev/null
+  wait_for_file_contains "$BATS_TEST_TMPDIR/broad.out" "before release"
+  agmsg_role_active_release T alice claude-code sid-broad sid-broad
+  bash "$SKILL_DIR/scripts/send.sh" T carol alice "after release" >/dev/null
   sleep 3
+  refute grep -q "after release" "$BATS_TEST_TMPDIR/broad.out"
+  source "$SKILL_DIR/scripts/lib/storage.sh"
+  agmsg_storage_load
+  [ "$(storage_list_unread T alice | grep -c .)" -eq 1 ]
 
-  # Both messages are delivered now: the one that arrived while it was held is
-  # still unread, so taking the pair back means handing it over, not skipping it.
-  bash "$SKILL_DIR/scripts/send.sh" T carol alice "after it was released" >/dev/null
-  sleep 3
-
-  run cat "$BATS_TEST_TMPDIR/broad.out"
-  [[ "$output" == *"while it was held"* ]]
-  [[ "$output" == *"after it was released"* ]]
-
-  # And the log shows both transitions, so a reader is not left thinking the
-  # role went away for good.
-  run cat "$BATS_TEST_TMPDIR/broad.err"
-  [[ "$output" == *"while they hold it"* ]]
-  [[ "$output" == *"unheld again"* ]]
-
+  agmsg_role_active_claim T alice sid-broad /tmp/p1 claude-code sid-broad
+  wait_for_file_contains "$BATS_TEST_TMPDIR/broad.out" "after release"
   kill "$broad" 2>/dev/null || true
   wait "$broad" 2>/dev/null || true
 }
 
-# Names are arbitrary UTF-8 minus a deny-list (validate.sh): a team name may
-# contain a regex metacharacter or a sed delimiter. The first version of this
-# bookkeeping tested membership with a `case` glob and removed entries with an
-# `s|…|…|` built from the name, and my first attempt at a test for it did not
-# discriminate -- it used one hostile name, and a removal that failed outright
-# still left the list empty, which looks the same from outside. Measured: the
-# broken version passed it.
-#
-# What separates them is a removal that takes MORE than it was asked for. Two
-# teams whose names differ only where the metacharacter sits, both held
-# elsewhere, and only one released: a regex removal drops both entries, so the
-# still-held one is announced a second time. The lock, not this list, decides
-# delivery -- so the assertion is on the log, which is the only thing the
-# bookkeeping controls.
-@test "watch: releasing one held pair does not forget another whose name it matches (#683)" {
+@test "watch: releasing one active pair preserves a regex-similar pair (#683)" {
   skip_on_windows "actas watcher process mgmt under Git Bash (#182)"
   fake_register 't.m' alice
   fake_register 'txm' alice
-
-  AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" "sid-broad" /tmp/p1 claude-code \
+  fake_register 't.m' carol
+  fake_register 'txm' carol
+  agmsg_role_active_claim 't.m' alice sid-broad /tmp/p1 claude-code sid-broad
+  agmsg_role_active_claim 'txm' alice sid-broad /tmp/p1 claude-code sid-broad
+  AGMSG_WATCH_INTERVAL=1 bash "$SKILL_DIR/scripts/watch.sh" sid-broad /tmp/p1 claude-code \
     > "$BATS_TEST_TMPDIR/n.out" 2> "$BATS_TEST_TMPDIR/n.err" 3>&- &
   local broad=$!
-  sleep 1
-
-  sleep 60 &
-  local newpid=$!
-  echo "sid-new" > "$RUN_DIR/cc-instance.$newpid"
-  echo "sid-new" > "$(actas_lock_path 't.m' alice)"
-  echo "sid-new" > "$(actas_lock_path 'txm' alice)"
-  sleep 3
-
-  # Release ONLY t.m. txm stays held, so nothing about it has changed.
-  rm -f "$(actas_lock_path 't.m' alice)"
-  sleep 4
-  kill "$newpid" 2>/dev/null || true
-
-  # t.m came back, exactly once.
-  run cat "$BATS_TEST_TMPDIR/n.err"
-  [[ "$output" == *"t.m/alice is unheld again"* ]]
-  [[ "$output" != *"txm/alice is unheld again"* ]]
-
-  # And txm was announced as held once, not twice: a removal that also dropped
-  # txm from the list makes the next cycle treat it as newly held and say so
-  # again.
-  local claims
-  claims="$(grep -c 'txm/alice was claimed' "$BATS_TEST_TMPDIR/n.err" || true)"
-  [ "$claims" -eq 1 ]
-
+  bash "$SKILL_DIR/scripts/send.sh" 't.m' carol alice "before release" >/dev/null
+  wait_for_file_contains "$BATS_TEST_TMPDIR/n.out" "before release"
+  agmsg_role_active_release 't.m' alice claude-code sid-broad sid-broad
+  bash "$SKILL_DIR/scripts/send.sh" 't.m' carol alice "released dot team" >/dev/null
+  bash "$SKILL_DIR/scripts/send.sh" 'txm' carol alice "still active x team" >/dev/null
+  wait_for_file_contains "$BATS_TEST_TMPDIR/n.out" "still active x team"
+  refute grep -q "released dot team" "$BATS_TEST_TMPDIR/n.out"
+  agmsg_role_active_matches 'txm' alice claude-code sid-broad /tmp/p1 sid-broad
   kill "$broad" 2>/dev/null || true
   wait "$broad" 2>/dev/null || true
 }

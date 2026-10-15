@@ -7,6 +7,7 @@ const fs = require("fs");
 const net = require("net");
 const path = require("path");
 const readline = require("readline");
+const { DesktopIpcClient } = require("./codex-desktop-ipc");
 
 const SCRIPT_DIR = __dirname;                              // .../scripts/drivers/types/codex (codex siblings live here)
 const SKILL_DIR = path.resolve(SCRIPT_DIR, "..", "..", "..", "..");    // skill root
@@ -43,11 +44,10 @@ Options:
                           Stop after n consecutive watch-once failures; 0 disables (default: 3).
   --app-server <url>      Connect through an existing app-server endpoint.
                           Supports unix://PATH or ws://host:port over WebSocket.
-  --thread <id|current|loaded>
-                          Resume an existing app-server thread. "current" uses
-                          CODEX_THREAD_ID; "loaded" discovers the live TUI thread
-                          via thread/loaded/list (codex 0.141+, see #170).
-  --loaded-timeout <ms>   Max wait for a loaded thread to appear (default: 30000).
+  --desktop              Use Codex Desktop's native ~/.codex/ipc/ipc.sock.
+  --desktop-ipc <path>    Use a specified Desktop IPC socket.
+  --thread <id|current>   Existing native thread with ACTIVE membership.
+                          "current" uses CODEX_THREAD_ID.
   --turn-timeout <sec>    Idle watchdog: assume a turn ended after this many
                           seconds with no app-server activity for it at all
                           (default: 60; 0 disables). Re-armed on any
@@ -231,6 +231,11 @@ function parseArgs(argv) {
       opts.turnTimeout = Number(argv[++i]);
     } else if (arg === "--app-server") {
       opts.appServer = argv[++i];
+    } else if (arg === "--desktop") {
+      opts.desktopIpc = path.join(require("os").homedir(), ".codex", "ipc", "ipc.sock");
+    } else if (arg === "--desktop-ipc") {
+      opts.desktopIpc = argv[++i];
+      if (!opts.desktopIpc) die("--desktop-ipc requires a socket path");
     } else if (arg === "--thread") {
       opts.threadId = argv[++i];
     } else if (arg === "--loaded-timeout") {
@@ -276,6 +281,11 @@ function parseArgs(argv) {
     opts.threadId = process.env.CODEX_THREAD_ID || "";
     if (!opts.threadId) die("--thread current requires CODEX_THREAD_ID");
   }
+  if (!opts.resolveOnly && (!opts.threadId || opts.threadId === "loaded")) {
+    die("delivery requires an explicit native thread with ACTIVE membership");
+  }
+  if (opts.desktopIpc && opts.appServer) die("choose one Desktop IPC or app-server transport");
+  if (opts.desktopIpc) opts.inlineInbox = true;
   opts.project = path.resolve(opts.project);
   if (!fs.existsSync(opts.project) || !fs.statSync(opts.project).isDirectory()) {
     die(`project path is not a directory: ${opts.project}`);
@@ -937,6 +947,7 @@ class CodexBridge {
   }
 
   async run() {
+    this.assertBinding();
     fs.mkdirSync(RUN_DIR, { recursive: true });
     this.ensureSingleInstance();
     this.writeMeta();
@@ -976,32 +987,8 @@ class CodexBridge {
     await this.ensureThread();
     if (this.opts.inlineInbox) this.recoverDelivery();
     await this.armWatch();
-    // After armWatch, not before: the seat is a claim that this role is being
-    // delivered to, and until the watch is armed that is not yet true.
-    this.recordSeat();
-  }
-
-  // Write the seat from the thread the bridge actually armed on (#579). Seating
-  // before this point can only ever be inference -- the app-server is the one
-  // that knows which thread this session got, and it does not know it until the
-  // resume above succeeded. So whatever seeded the seat earlier, the value it
-  // guessed is replaced here by one the app-server confirmed.
-  //
-  // Best-effort by design: a failure to record costs the NEXT session a resume,
-  // not this one, which is already armed and delivering. Never let it take the
-  // bridge down.
-  recordSeat() {
-    if (!this.threadId || this.threadId === "loaded") return;
-    for (const pair of this.identities) {
-      try {
-        spawnSync(BASH_BIN, [
-          path.join(SCRIPT_DIR, "codex-record-session.sh"),
-          pair.team, pair.name, toPosixPath(this.opts.project),
-        ], { cwd: SKILL_DIR, encoding: "utf8", env: { ...process.env, CODEX_THREAD_ID: this.threadId } });
-      } catch (error) {
-        console.error(`codex-bridge: could not record seat for ${pair.team}/${pair.name}: ${error.message}`);
-      }
-    }
+    // Only explicit actas/join activates membership and records resume history.
+    // A delivery worker must never reclaim a role after a concurrent leave.
   }
 
   clientHandler(method, handler) {
@@ -1060,34 +1047,7 @@ class CodexBridge {
     this.client.notify("initialized");
   }
 
-  async resolveLoadedThread() {
-    // codex 0.141+ does not export CODEX_THREAD_ID to hooks and writes no rollout
-    // for --remote sessions, so the thread id cannot be resolved out-of-band.
-    // Ask the app-server which thread the live TUI has loaded instead. See #170.
-    const deadline = Date.now() + (this.opts.loadedTimeout || 30000);
-    for (;;) {
-      const response = await this.client.request("thread/loaded/list", {});
-      const ids = response && Array.isArray(response.data) ? response.data : [];
-      if (ids.length > 0) {
-        if (ids.length > 1) {
-          console.error(
-            `codex-bridge: ${ids.length} threads loaded; attaching to the first (${ids[0]})`,
-          );
-        }
-        return ids[0];
-      }
-      if (Date.now() >= deadline) {
-        die("no loaded codex thread found via thread/loaded/list");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-  }
-
   async ensureThread() {
-    if (this.threadId === "loaded") {
-      this.threadId = await this.resolveLoadedThread();
-      console.error(`codex-bridge: discovered loaded thread ${this.threadId}`);
-    }
     if (this.threadId) {
       let response;
       try {
@@ -1098,6 +1058,7 @@ class CodexBridge {
           excludeTurns: true,
         });
       } catch (err) {
+        if (this.opts.desktopIpc) throw err;
         // Codex 0.142+'s --remote sessions may not create a rollout, which
         // makes the thread/resume request itself fail outright. turn/start
         // only needs threadId, so keep the bridge alive by falling back to
@@ -1122,22 +1083,15 @@ class CodexBridge {
       // turn/start to hang a watchdog off of. Arm one here too so a pending
       // wake never waits on it forever. See #299.
       if (this.turnActive) this.startTurnWatchdog();
-      console.error(`codex-bridge: resumed thread ${this.threadId}`);
+      console.error(`codex-bridge: attached ${this.identity.team}/${this.identity.name}`);
       return;
     }
-    const response = await this.client.request("thread/start", {
-      cwd: this.opts.project,
-      runtimeWorkspaceRoots: this.opts.workspaceRoots,
-      ephemeral: false,
-    });
-    this.threadId = response.thread && response.thread.id;
-    if (!this.threadId) die("thread/start did not return a thread id");
-    console.error(`codex-bridge: started thread ${this.threadId}`);
   }
 
   async armWatch() {
     this.clearWatchRearmTimer();
     if (this.stopping || this.watchHandle) return;
+    this.assertBinding();
     const handle = `agmsg-watch-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     this.watchHandle = handle;
     const command = [
@@ -1152,6 +1106,8 @@ class CodexBridge {
       String(this.opts.timeout),
       "--interval",
       String(this.opts.interval),
+      "--session",
+      this.threadId,
     ];
     for (const pair of this.identities) command.push("--pair", `${pair.team}\t${pair.name}`);
     try {
@@ -1255,7 +1211,7 @@ class CodexBridge {
     if (params.turn && params.turn.error) {
       console.error(`codex-bridge: turn completed with error: ${JSON.stringify(params.turn.error)}`);
     } else {
-      console.error(`codex-bridge: turn completed on thread ${this.threadId}`);
+      console.error(`codex-bridge: turn completed for ${this.identity.team}/${this.identity.name}`);
     }
     await this.onTurnEnded();
   }
@@ -1296,6 +1252,7 @@ class CodexBridge {
       return this.deliveryPromise;
     }
     if (!this.pendingWake || this.turnActive || !this.threadIdle) return;
+    this.assertBinding(true);
     const prompt = this.buildPrompt();
     this.turnActive = true;
     this.threadIdle = false;
@@ -1306,7 +1263,7 @@ class CodexBridge {
         cwd: this.opts.project,
         runtimeWorkspaceRoots: this.opts.workspaceRoots,
       });
-      console.error(`codex-bridge: started turn on thread ${this.threadId}`);
+      console.error(`codex-bridge: started turn for ${this.identity.team}/${this.identity.name}`);
       this.pendingWake = false;
       // Bound how long we treat the turn as active. The real app-server may
       // never send turn/completed; the watchdog (and thread/status idle) drive
@@ -1411,11 +1368,21 @@ class CodexBridge {
     ].join("\n");
   }
 
-  eligiblePairs() {
+  eligiblePairs(bindingOnly = false) {
     const result = spawnSync(BASH_BIN, [path.join(SCRIPT_DIR, "eligible-pairs.sh"), toPosixPath(this.opts.project), this.opts.type,
+      "--session", this.threadId || "",
+      ...(bindingOnly ? ["--binding-only"] : []),
       ...this.identities.flatMap((pair) => ["--pair", `${pair.team}\t${pair.name}`])], { cwd: this.opts.project, encoding: "utf8" });
     if (result.error || result.status !== 0) throw new Error("cannot validate delivery identities");
     return new Set((result.stdout || "").split(/\r?\n/).filter(Boolean));
+  }
+
+  assertBinding(fullRoster = false) {
+    if (!this.threadId || this.threadId === "loaded") throw new Error("delivery requires an explicit native thread with ACTIVE membership");
+    const allowed = this.eligiblePairs(!fullRoster);
+    if (!this.identities.every((pair) => allowed.has(`${pair.team}\t${pair.name}`))) {
+      throw new Error("current native session does not own ACTIVE membership; inbox remains unread");
+    }
   }
 
   peekInbox() {
@@ -1433,9 +1400,15 @@ class CodexBridge {
   }
 
   saveDelivery(record) {
+    // Durable journal replacement must stay on the same filesystem. This is
+    // runtime atomic staging, not task/test scratch (which uses TMPDIR).
     const temp = `${this.deliveryFile}.${process.pid}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify(record) + "\n", { mode: 0o600 });
-    fs.renameSync(temp, this.deliveryFile);
+    try {
+      fs.writeFileSync(temp, JSON.stringify(record) + "\n", { mode: 0o600 });
+      fs.renameSync(temp, this.deliveryFile);
+    } finally {
+      if (fs.existsSync(temp)) fs.unlinkSync(temp);
+    }
   }
 
   acknowledgeDelivery(record) {
@@ -1472,7 +1445,14 @@ class CodexBridge {
 
   async deliverInline() {
     if (!this.pendingWake || this.stopping) return;
+    this.assertBinding();
     this.recoverDelivery();
+    if (this.opts.desktopIpc) {
+      const state = await this.client.refreshState(this.threadId);
+      this.turnActive = state.active;
+      this.threadIdle = !state.active;
+      this.activeTurnId = state.turnId;
+    }
     const batches = this.peekInbox();
     if (!batches.length) {
       this.pendingWake = false;
@@ -1485,16 +1465,22 @@ class CodexBridge {
     this.inlineInboxText = `${rows.length} new message(s):\n\n` + rows.map((row) =>
       `  [${row.at}] ${row.from}: ${row.body.replace(/\n/g, "\\n").replace(/\t/g, "\\t")}`).join("\n");
     const record = { state: "sending", threadId: this.threadId,
+      ...(this.client.prepareDelivery ? this.client.prepareDelivery() : {}),
       batches: batches.map((b) => ({ team: b.team, name: b.name, ids: b.rows.map((r) => String(r.id)) })) };
     const active = this.turnActive || !this.threadIdle;
     const params = { threadId: this.threadId, input: [{ type: "text", text: this.buildPrompt(), text_elements: [] }] };
     if (active) params.expectedTurnId = await this.resolveActiveTurn();
     else Object.assign(params, { cwd: this.opts.project, runtimeWorkspaceRoots: this.opts.workspaceRoots });
+    if (this.opts.desktopIpc) params.delivery = record;
+    this.assertBinding(true);
     this.saveDelivery(record);
     try {
       const response = await this.client.request(active ? "turn/steer" : "turn/start", params);
       if (active && response.turnId !== params.expectedTurnId) throw new Error("steer response turn mismatch; outcome uncertain");
+      const turnId = active ? response.turnId : response.turn?.id;
+      if (typeof turnId !== "string" || !turnId) throw new Error("accepted response omitted turn ID; outcome uncertain");
       record.state = "accepted";
+      record.turnId = turnId;
       this.saveDelivery(record);
       this.acknowledgeDelivery(record);
       this.pendingWake = false;
@@ -1502,7 +1488,7 @@ class CodexBridge {
       this.threadIdle = false;
       this.activeTurnId = active ? response.turnId : (response.turn && response.turn.id) || this.activeTurnId;
       this.startTurnWatchdog();
-      console.error(`codex-bridge: ${active ? "steered active" : "started"} turn on thread ${this.threadId}`);
+      console.error(`codex-bridge: ${active ? "steered active" : "started"} turn for ${this.identity.team}/${this.identity.name}`);
       // Continue observing even during this turn: a later DONE must not wait
       // for an actively working parent to decide to yield.
       await this.armWatch();
@@ -1635,6 +1621,7 @@ function parseWsTarget(url) {
 }
 
 function createAppServerClient(opts) {
+  if (opts.desktopIpc) return new DesktopIpcClient(opts.desktopIpc, opts);
   if (opts.appServer && opts.appServer.startsWith("unix://")) {
     const rawSocketPath = opts.appServer.slice("unix://".length);
     if (!rawSocketPath) die("--app-server unix:// requires a socket path");

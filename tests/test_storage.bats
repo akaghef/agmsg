@@ -88,6 +88,7 @@ SH
   # Register an agent so check-inbox can resolve identity via whoami.
   bash "$SCRIPTS/join.sh" testteam alice claude-code "$project"
   bash "$SCRIPTS/join.sh" testteam bob claude-code /tmp/agmsg-storage-test-bob
+  AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/actas-claim.sh" "$project" claude-code alice storage-session >/dev/null
 
   # A message addressed to alice lives only in the overridden store.
   AGMSG_STORAGE_PATH="$store" bash "$SCRIPTS/send.sh" testteam bob alice "via override store"
@@ -97,7 +98,7 @@ SH
 
   # Stop-hook delivery must still succeed (exit 0) and surface the message —
   # the cooldown marker now lives in run/, not the (absent) db dir.
-  run bash -c "echo '{}' | AGMSG_STORAGE_PATH='$store' bash '$SCRIPTS/check-inbox.sh' claude-code '$project'"
+  run bash -c "echo '{\"session_id\":\"storage-session\"}' | AGMSG_RESOLVE_PROJECT=0 AGMSG_STORAGE_PATH='$store' bash '$SCRIPTS/check-inbox.sh' claude-code '$project'"
   [ "$status" -eq 0 ]
   [[ "$output" =~ "via override store" ]]
 }

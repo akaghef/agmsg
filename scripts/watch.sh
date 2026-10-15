@@ -49,6 +49,7 @@ agmsg_storage_load
 source "$SCRIPT_DIR/lib/actas-lock.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/resolve-project.sh"
+source "$SCRIPT_DIR/lib/subscription.sh"
 
 # Resolve a session id when the launcher could not bake one in (empty first arg).
 # Grok Build's `monitor` tool runs the watcher with $GROK_SESSION_ID unset, so
@@ -91,6 +92,7 @@ PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
 # already passes a composite id (no re-derive); the command template's manual
 # monitor/actas/drop steps pass a bare session_id and we self-derive here.
 SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$AGENT_TYPE")"
+[ "$AGENT_TYPE" != codex ] || SESSION_ID="${CODEX_THREAD_ID:-}"
 
 RUN_DIR="$SKILL_DIR/run"
 PIDFILE="$RUN_DIR/watch.$SESSION_ID.pid"
@@ -294,7 +296,7 @@ fi
 # doing the same. Exclusion is a separate decision.
 # Only when the hazard is real. A warning printed on every start is a warning
 # nobody reads, and an unfiltered watcher running alone is not in danger.
-if [ -z "$ACTIVE_NAME" ]; then
+if [ -z "$ACTIVE_NAME" ] && [ "$AGENT_TYPE" != claude-code ] && [ "$AGENT_TYPE" != codex ]; then
   _sharing=0
   for _pf in "$RUN_DIR"/watch.*.pid; do
     [ -f "$_pf" ] || continue
@@ -429,69 +431,9 @@ _install_changed() {
   [ -n "$(find "$SCRIPT_DIR" -newer "$INSTALL_STAMP" -print -quit 2>/dev/null)" ]
 }
 
-# Resolve subscription set.
-PAIRS="$("$SCRIPT_DIR/identities.sh" "$PROJECT_PATH" "$AGENT_TYPE")"
-if [ -n "$ACTIVE_NAME" ]; then
-  PAIRS=$(printf '%s\n' "$PAIRS" | awk -v n="$ACTIVE_NAME" -F'\t' 'NF >= 2 && $2 == n')
-fi
-
-# Honor actas exclusivity locks. A (team, agent) pair currently owned by
-# another live session is removed from this watcher's subscription so
-# messages addressed to that role only reach the owning session. Pairs we
-# own (or that are free) stay in. See #62.
-#
-# When ACTIVE_NAME is set (the watcher was launched by an `actas` flow),
-# we also CLAIM the lock for each surviving pair. Implicit claim here makes
-# the exclusivity take effect machine-wide on the next peer watcher cycle,
-# without needing the skill cmd templates to call a separate helper. If a
-# claim fails because another live session beat us to it, exit with an
-# error — the user's host agent surfaces stderr and the original (broad)
-# watcher was already stopped by the actas flow, so this state is recoverable
-# by `drop` on the other session.
-if [ -n "$PAIRS" ]; then
-  filtered=""
-  skipped=""
-  held=""
-  while IFS=$'\t' read -r _team _agent; do
-    [ -z "$_team" ] && continue
-    state=$(actas_lock_state "$_team" "$_agent" "$SESSION_ID")
-    case "$state" in
-      other:*)
-        # If the caller is asking specifically for this name (actas flow),
-        # treat the conflict as a hard failure. Otherwise (broad subscribe)
-        # silently skip — peer owns the role, we don't need it.
-        if [ -n "$ACTIVE_NAME" ]; then
-          held="${held:+$held }${_team}/${_agent}(${state#other:})"
-        else
-          skipped="${skipped:+$skipped }${_team}/${_agent}(${state#other:})"
-        fi
-        continue
-        ;;
-    esac
-    if [ -n "$ACTIVE_NAME" ]; then
-      # Implicit claim — `actas` was the invoking flow. Covers the race
-      # where state-check said free but a peer claimed it between then and
-      # now.
-      result=$(actas_lock_claim "$_team" "$_agent" "$SESSION_ID" 2>/dev/null || true)
-      case "$result" in
-        held:*)
-          held="${held:+$held }${_team}/${_agent}(${result#held:})"
-          continue
-          ;;
-      esac
-    fi
-    filtered="${filtered:+$filtered$'\n'}${_team}"$'\t'"${_agent}"
-  done <<< "$PAIRS"
-  PAIRS="$filtered"
-  if [ -n "$skipped" ]; then
-    echo "agmsg watch: skipping pairs held by other sessions: $skipped" >&2
-  fi
-  if [ -n "$held" ]; then
-    echo "agmsg watch: cannot claim (held by other sessions): $held" >&2
-    echo "agmsg watch: run \`/agmsg drop <name>\` in the owning session, then retry." >&2
-    exit 1
-  fi
-fi
+# The subscription helper requires ACTIVE membership for Claude/Codex.
+# Passing a role name only filters a prior explicit claim.
+PAIRS="$(agmsg_subscription_pairs "$PROJECT_PATH" "$AGENT_TYPE" "$SESSION_ID" "$ACTIVE_NAME" claim)" || exit 1
 
 if [ -z "$PAIRS" ]; then
   if [ -n "$ACTIVE_NAME" ]; then
@@ -546,8 +488,9 @@ if [ -n "$ACTIVE_NAME" ]; then
 fi
 
 # Pairs another session currently holds, so each departure and each return is
-# announced once instead of every cycle. Membership is not a decision -- the
-# lock is -- it only records what has already been said (#683).
+# announced once instead of every cycle. This announcement cache records only
+# what has already been said; ACTIVE membership and the owner lock authorize
+# delivery independently (#683).
 #
 # Held as newline-separated entries and compared as EXACT strings, never as
 # patterns. A team name is arbitrary UTF-8 minus a path deny-list and an agent
@@ -628,6 +571,14 @@ while true; do
     # Only the lock file is read here, not the whole subscription set: losing a
     # pair is the half a running process can detect for the price of a file
     # read. Gaining one is the caller's job, at the point it creates the team.
+    case "$AGENT_TYPE" in
+      claude-code|codex)
+        if ! agmsg_role_active_matches "$pair_team" "$pair_agent" "$AGENT_TYPE" "$(agmsg_instance_bare_sid "$SESSION_ID")" "$(agmsg_canonical_path "$PROJECT_PATH")" "$SESSION_ID"; then
+          [ -z "$ACTIVE_NAME" ] || { watch_log "active membership ended; stopping."; exit 0; }
+          continue
+        fi
+        ;;
+    esac
     pair_state="$(actas_lock_state "$pair_team" "$pair_agent" "$SESSION_ID" 2>/dev/null || echo free)"
     case "$pair_state" in
       other:*)
@@ -716,6 +667,10 @@ while true; do
       fi
       [ "$kind" = "message_sent" ] || continue
       [ -z "$id" ] && continue
+      case "$AGENT_TYPE" in
+        claude-code|codex)
+          agmsg_role_active_matches "$pair_team" "$pair_agent" "$AGENT_TYPE" "$(agmsg_instance_bare_sid "$SESSION_ID")" "$(agmsg_canonical_path "$PROJECT_PATH")" "$SESSION_ID" || exit 0 ;;
+      esac
       # Control message: a leader's `despawn` sends `ctrl:despawn` to this
       # role. Tear ourselves down rather than printing it — drop the role
       # (releases the lock + registration) then close our own tmux pane,

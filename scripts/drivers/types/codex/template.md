@@ -134,9 +134,13 @@ If argument starts with "actas" followed by an agent name (e.g. "actas alice"):
 1. Parse the new role name. If none was given (e.g. bare "actas", or the user asks you to suggest one), run `~/.agents/skills/__SKILL_NAME__/scripts/team.sh <team>` for each TEAM to see the current roster. Look for a naming convention already in play (e.g. a shared base name with role and number suffixes (`<base>-<role><n>`), or names derived from the team name) and, when one exists, propose 2-3 unused names that extend it; otherwise propose 2-3 short, distinctive identity names (not a bare tool-type label). Either way, names must not collide with the roster. Ask the user to pick one or type their own before continuing.
 2. Run `~/.agents/skills/__SKILL_NAME__/scripts/identities.sh "$(pwd)" codex` to see whether the role is already registered for this (project, type).
 3. If the name does not appear in the output, join under the existing team. For a single team, run `~/.agents/skills/__SKILL_NAME__/scripts/join.sh <team> <name> codex "$(pwd)"`. For multiple teams, ask the user which team to join the new role into.
-4. Set the session's active FROM to `<name>` for every `send.sh` call until another `actas`.
-5. Record this session as the role's seat so it can be resumed later (best-effort): determine which team `<name>` belongs to (from the identities output / the join above), then run `~/.agents/skills/__SKILL_NAME__/scripts/drivers/types/codex/codex-record-session.sh <team> <name>` (the script resolves the project directory itself). It writes the record only when this session's codex thread id is unambiguous; otherwise it records nothing and the role simply boots fresh next time (no harm). This is what lets a later `spawn <role>` bring the role back into this conversation.
-6. Tell the user: "Now acting as `<name>`. Sends will use `<name>` as the from agent. In monitor mode, each role's incoming messages are routed only to that role's recorded Codex thread; roles without a recorded thread remain unread."
+4. Explicitly join this native session to the role: run `~/.agents/skills/__SKILL_NAME__/scripts/drivers/types/codex/codex-record-session.sh <team> <name>`. The command requires this session's `CODEX_THREAD_ID`; never infer membership from a project, a recent rollout, or a historical resume record. On failure, report it and do not claim that this session joined.
+5. After successful activation, set the session's active FROM to `<name>` for every `send.sh` call until another `actas` or `leave`.
+6. Tell the user: "Now acting as `<name>`. Incoming team mail is restricted to this joined session." Historical records support resume only. Unclaimed roles stay unread, and sessions that did not join receive no automatic mail or unread summary.
+
+If argument starts with "leave" followed by an agent name (e.g. "leave alice"):
+1. Run `~/.agents/skills/__SKILL_NAME__/scripts/leave.sh "$(pwd)" codex <name>`. It removes only this session's matching active membership, retaining the role registration and resume history.
+2. Clear the active FROM if it was `<name>` and report that this session left the role. Use `actas` to join again.
 
 If argument starts with "drop" followed by an agent name (e.g. "drop alice"):
 1. Parse the role name.

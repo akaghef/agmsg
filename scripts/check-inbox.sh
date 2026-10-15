@@ -18,6 +18,7 @@ source "$SCRIPT_DIR/lib/actas-lock.sh"
 source "$SCRIPT_DIR/lib/resolve-project.sh"  # agmsg_agent_pid, for instance-id derivation
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/type-registry.sh"
+source "$SCRIPT_DIR/lib/subscription.sh"
 
 # Some Stop-hook runtimes (codex, copilot) want an explicit JSON status object
 # even when there is nothing to deliver; others (claude-code) stay silent. This
@@ -66,9 +67,11 @@ SESSION_ID=$(printf '%s' "$INPUT" \
   | sed -n 's/.*"sessionId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
   | head -1)
 [ -z "$SESSION_ID" ] && SESSION_ID="${GROK_SESSION_ID:-}"
+[ "$TYPE" != codex ] || SESSION_ID="${CODEX_THREAD_ID:-}"
 # Normalized to the per-process instance id (#93), which is the token the
 # actas owner file is keyed on.
-[ -n "$SESSION_ID" ] && SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$TYPE")"
+[ -n "$SESSION_ID" ] && SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$TYPE" 2>/dev/null)"
+[ "$TYPE" != codex ] || SESSION_ID="${CODEX_THREAD_ID:-}"
 
 # No deferral to a live watcher (#694).
 #
@@ -98,33 +101,39 @@ SESSION_ID=$(printf '%s' "$INPUT" \
 # Deferral was an optimisation, not a correctness requirement. The read state
 # is the correctness requirement, and it was already there.
 
-# Identify agent and teams
-WHOAMI=$("$SCRIPT_DIR/whoami.sh" "$PROJECT" "$TYPE")
-# suggest=true means this identity is registered only under a DIFFERENT
-# project, so it is not joined here -> deliver nothing (mirror not_joined).
-# Without this the else-branch extracts "agents=" as the agent name.
-if echo "$WHOAMI" | grep -Eq "not_joined=true|suggest=true"; then
-  exit 0
-fi
-
-# Handle multiple identities: use first agent name
-if echo "$WHOAMI" | grep -q "multiple=true"; then
-  AGENT=$(echo "$WHOAMI" | sed -n 's/.*agents=\([^,]*\).*/\1/p')
-else
-  # Anchor on a leading "agent=" so "agents=" (multiple/suggest) cannot match.
-  AGENT=$(echo "$WHOAMI" | sed -n 's/^agent=\([^ ]*\).*/\1/p')
-fi
-TEAMS=$(echo "$WHOAMI" | sed -n 's/.*teams=\([^ ]*\).*/\1/p')
-
-if [ -z "$AGENT" ] || [ -z "$TEAMS" ]; then
-  exit 0
-fi
+# Resolve every explicitly bound role for this session. Project registration
+# and first-role selection do not authorize delivery.
+PROJECT="$(agmsg_resolve_project "$PROJECT" "$TYPE")"
+case "$TYPE" in
+  claude-code|codex)
+    PAIRS="$(agmsg_subscription_pairs "$PROJECT" "$TYPE" "$SESSION_ID" 2>/dev/null)" ;;
+  *)
+    # Preserve the existing first-role policy for other runtime adapters.
+    WHOAMI=$("$SCRIPT_DIR/whoami.sh" "$PROJECT" "$TYPE")
+    if echo "$WHOAMI" | grep -Eq 'not_joined=true|suggest=true'; then exit 0; fi
+    if echo "$WHOAMI" | grep -q 'multiple=true'; then
+      AGENT=$(echo "$WHOAMI" | sed -n 's/.*agents=\([^,]*\).*/\1/p')
+    else
+      AGENT=$(echo "$WHOAMI" | sed -n 's/^agent=\([^ ]*\).*/\1/p')
+    fi
+    TEAMS=$(echo "$WHOAMI" | sed -n 's/.*teams=\([^ ]*\).*/\1/p')
+    [ -n "$AGENT" ] && [ -n "$TEAMS" ] || exit 0
+    PAIRS=""
+    IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
+    for team in "${TEAM_LIST[@]}"; do
+      PAIRS="${PAIRS:+$PAIRS$'\n'}$team"$'\t'"$AGENT"
+    done ;;
+esac
+[ -n "$PAIRS" ] || exit 0
 
 # Cooldown check. The marker is hook runtime state, not message storage, so it
 # lives in the skill's run dir — independent of AGMSG_STORAGE_PATH. Keeping it
 # out of the store means an overridden/sandboxed store still gets delivery even
 # when the default db dir doesn't exist.
-MARKER="$SKILL_DIR/run/.lastcheck-$AGENT"
+case "$TYPE" in
+  claude-code|codex) MARKER="$SKILL_DIR/run/.lastcheck-$(_actas_lock_encode "$TYPE.$SESSION_ID")" ;;
+  *) MARKER="$SKILL_DIR/run/.lastcheck-$AGENT" ;;
+esac
 
 if [ -f "$MARKER" ]; then
   last=$(compat_file_mtime "$MARKER")
@@ -173,8 +182,8 @@ agmsg_storage_load
 OUTPUT=""
 LOOP_RC=0
 LOOP_FAILED_TEAM=""
-IFS=',' read -ra TEAM_LIST <<< "$TEAMS"
-for team in "${TEAM_LIST[@]}"; do
+while IFS=$'\t' read -r team AGENT; do
+  [ -n "$team" ] || continue
   storage_store_exists "$team" || continue
 
   # ONE guarded boundary for everything that reads or formats — and it must NOT
@@ -210,22 +219,13 @@ for team in "${TEAM_LIST[@]}"; do
   set +e
   RESULT=$(
     set -euo pipefail
-    # Honor actas exclusivity locks. If (team, AGENT) is held by another live
-    # session, that session owns that role's inbox — don't deliver here.
-    # Mirrors watch.sh's per-pair filtering (#62).
-    #
-    # AGENT comes from whoami.sh: the first registered agent for
-    # (project, type), NOT the session's in-memory actas role — the Codex
-    # caveat documented in README.
-    state=$(actas_lock_state "$team" "$AGENT" "${SESSION_ID:-}")
-    # The leading `(` is load-bearing, not style. bash 3.2 -- which is /bin/bash
-    # on macOS, and what the macOS CI jobs run -- scans `$( ... )` for its
-    # closing paren without understanding `case`, so an unbalanced pattern paren
-    # ends the substitution early and the `;;` that follows is a syntax error.
-    # The whole file failed to parse; every check-inbox test on macOS died with
-    # "syntax error near unexpected token `;;'". Balancing the paren fixes it and
-    # is identical under bash 5.
-    case "$state" in (other:*) exit 97 ;; esac
+    # Recheck immediately before reading: membership may end after selection.
+    case "$TYPE" in
+      (claude-code|codex)
+        agmsg_role_active_matches "$team" "$AGENT" "$TYPE" "$(agmsg_instance_bare_sid "$SESSION_ID")" "$(agmsg_canonical_path "$PROJECT")" "$SESSION_ID" || exit 97 ;;
+      (*) state=$(actas_lock_state "$team" "$AGENT" "$SESSION_ID")
+          case "$state" in (other:*) exit 97 ;; esac ;;
+    esac
 
     # Unread via the storage facade (§2.1 storage_list_unread = events ∪ legacy),
     # JSONL parsed in one pass with sqlite's JSON funcs (no jq; cf. lib/hooks-json.sh).
@@ -249,6 +249,10 @@ for team in "${TEAM_LIST[@]}"; do
     *)     LOOP_RC=$_rc; LOOP_FAILED_TEAM="$team"; break ;;
   esac
 
+  case "$TYPE" in
+    claude-code|codex)
+      agmsg_role_active_matches "$team" "$AGENT" "$TYPE" "$(agmsg_instance_bare_sid "$SESSION_ID")" "$(agmsg_canonical_path "$PROJECT")" "$SESSION_ID" || continue ;;
+  esac
   COUNT=$(printf '%s\n' "$RESULT" | grep -c . || true)
   OUTPUT+="$COUNT new message(s) in $team:"$'\n'
   IDS=()
@@ -277,7 +281,7 @@ for team in "${TEAM_LIST[@]}"; do
   if [ "${#IDS[@]}" -gt 0 ]; then
     storage_mark_read_batch "$team" "$AGENT" "${IDS[@]}" >/dev/null 2>&1 || true
   fi
-done
+done <<< "$PAIRS"
 
 # The exit code cannot carry both the delivery and the failure report.
 #

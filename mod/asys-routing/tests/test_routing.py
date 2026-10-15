@@ -62,10 +62,11 @@ class Routing(unittest.TestCase):
             self.assertEqual(hook["timeout"],10)
         hook_script=live/"scripts/agmsg-routing/hooks/session-start.sh"; cwd=base/"unmapped"; cwd.mkdir()
         hook_env=env.copy(); hook_env.pop("AGMSG_AGENT_ID",None); hook_env["AGMSG_BRIDGE_ROOT"]=str(pathlib.Path(os.environ["AGMSG_BRIDGE_ROOT"])); hook_env["AGMSG_STATE_DIR"]=str(pathlib.Path(os.environ["AGMSG_STATE_DIR"]))
-        subprocess.run(["bash",str(hook_script),"--runtime","codex"],cwd=cwd,env=hook_env,text=True,capture_output=True,check=True)
-        presence=json.loads((bridge/"presence/mac.json").read_text())
-        self.assertEqual(presence["agents"],[]); self.assertEqual(presence["runtime"],"codex")
-        self.assertEqual(presence["teams"],[])
+        presence_file=bridge/"presence/mac.json"
+        before_presence=presence_file.read_bytes() if presence_file.exists() else None
+        hook_result=subprocess.run(["bash",str(hook_script),"--runtime","codex"],cwd=cwd,env=hook_env,text=True,capture_output=True,check=True)
+        self.assertEqual(hook_result.stdout, "")
+        self.assertEqual(presence_file.read_bytes() if presence_file.exists() else None, before_presence)
         storage=live/"scripts/lib/storage.sh"; storage.parent.mkdir(parents=True,exist_ok=True)
         storage.write_text('agmsg_storage_load(){ :; }\nstorage_list_unread(){ printf "%s|%s" "$1" "$2" > "$AGMSG_TEST_STORAGE_CAPTURE"; }\n')
         capture=base/"storage-args.txt"; hook_env["AGMSG_TEST_STORAGE_CAPTURE"]=str(capture)

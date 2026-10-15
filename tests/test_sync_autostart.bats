@@ -301,6 +301,10 @@ write_fake_remote() {
   cp "$fake" "$SCRIPTS/remote.sh"
   : > "$calls"
   fake_register testteam alice
+  source "$SCRIPTS/lib/resolve-project.sh"
+  source "$SCRIPTS/lib/role-session.sh"
+  local owner; owner="$(agmsg_normalize_instance_id sid-current claude-code)"
+  agmsg_role_active_claim testteam alice sid-current /tmp/p1 claude-code "$owner"
   echo "sid-current" > "$RUN_DIR/cc-instance.$$"
 
   run env AGMSG_FAKE_REMOTE_CALLS="$calls" bash -c \
@@ -327,6 +331,10 @@ write_fake_remote() {
   cp "$fake" "$SCRIPTS/remote.sh"
   : > "$calls"
   fake_register testteam alice
+  source "$SCRIPTS/lib/resolve-project.sh"
+  source "$SCRIPTS/lib/role-session.sh"
+  local owner; owner="$(agmsg_normalize_instance_id sid-current claude-code)"
+  agmsg_role_active_claim testteam alice sid-current /tmp/p1 claude-code "$owner"
   echo "sid-current" > "$RUN_DIR/cc-instance.$$"
 
   began=$SECONDS

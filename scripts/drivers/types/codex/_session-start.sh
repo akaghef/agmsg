@@ -50,50 +50,8 @@ agmsg_newest_rollout_files() {
   done | sort -t "$(printf '\t')" -k1,1rn | awk -F'\t' -v n="$limit" 'NR<=n { sub(/^[^\t]*\t/, ""); print }'
 }
 
-# Resolve the current Codex thread id. CODEX_THREAD_ID is only exported on the
-# interactive --remote path; fresh and `codex exec` sessions never export it, so
-# fall back to the newest rollout file whose session_meta cwd matches the
-# project. Codex writes that rollout ~1s before SessionStart, so it is already
-# present; a short bounded retry covers the race if it is not. See #41.
-agmsg_resolve_codex_thread() {
-  local project="$1"
-  if [ -n "${CODEX_THREAD_ID:-}" ]; then
-    printf '%s' "$CODEX_THREAD_ID"
-    return 0
-  fi
-  local sessions_dir="$HOME/.codex/sessions"
-  [ -d "$sessions_dir" ] || return 0
-  # Compare PHYSICAL paths. agmsg may open the project via a symlinked/logical
-  # path (e.g. a workspace under a symlinked home) while Codex records the
-  # canonical cwd in session_meta. A raw string compare then misses every
-  # rollout, so the thread is never resolved and the bridge never starts. See
-  # #160. Canonicalize the project once; canonicalize each rollout cwd per row.
-  local project_phys
-  project_phys=$(agmsg_canonical_path "$project")
-  local waited=0 f first esc cwd cwd_phys tid
-  while :; do
-    while IFS= read -r f; do
-      [ -f "$f" ] || continue
-      first=$(head -1 "$f" 2>/dev/null)
-      case "$first" in *'"session_meta"'*) ;; *) continue ;; esac
-      esc=$(printf '%s' "$first" | sed "s/'/''/g")
-      cwd=$(agmsg_sqlite_mem "SELECT COALESCE(json_extract('$esc','\$.payload.cwd'),'')" 2>/dev/null)
-      cwd_phys=$(agmsg_canonical_path "$cwd")
-      [ "$cwd_phys" = "$project_phys" ] || continue
-      tid=$(agmsg_sqlite_mem "SELECT COALESCE(json_extract('$esc','\$.payload.id'),'')" 2>/dev/null)
-      if [ -n "$tid" ]; then
-        printf '%s' "$tid"
-        return 0
-      fi
-    done <<INNER_EOF
-$(agmsg_newest_rollout_files "$sessions_dir" 20)
-INNER_EOF
-    [ "$waited" -ge 2 ] && break
-    waited=$((waited + 1))
-    sleep 1
-  done
-  return 0
-}
+# Native runtime identity only. Rollouts are resume history, not authorization.
+agmsg_resolve_codex_thread() { printf '%s' "${CODEX_THREAD_ID:-}"; }
 
 agmsg_session_start() {
   thread_id="$(agmsg_resolve_codex_thread "$PROJECT")"
@@ -107,15 +65,7 @@ agmsg_session_start() {
   safe_pairs=""
   while IFS=$'\t' read -r candidate_team candidate_name; do
     [ -n "$candidate_team" ] || continue
-    candidate_thread="$(agmsg_role_session_uuid "$candidate_team" "$candidate_name" 2>/dev/null || true)"
-    if [ -n "$candidate_thread" ]; then
-      candidate_project="$(agmsg_role_session_get "$candidate_team" "$candidate_name" project 2>/dev/null || true)"
-      candidate_project_phys="$(agmsg_canonical_path "$candidate_project" 2>/dev/null || printf '%s' "$candidate_project")"
-      { [ "$candidate_project_phys" = "$project_phys" ] && [ "$candidate_thread" = "$thread_id" ]; } || continue
-    else
-      # No recorded seat means no live TUI for this role; leave its inbox unread.
-      continue
-    fi
+    agmsg_role_active_matches "$candidate_team" "$candidate_name" codex "$thread_id" "$project_phys" "$thread_id" || continue
     safe_pairs="${safe_pairs:+$safe_pairs$'\n'}${candidate_team}"$'\t'"${candidate_name}"
   done <<< "$PAIRS"
   PAIRS="$safe_pairs"
@@ -136,6 +86,10 @@ agmsg_session_start() {
     if [ -S "$socket_path" ] || [ "${AGMSG_TEST_ASSUME_CODEX_SOCKET:-}" = "$socket_path" ]; then
       app_server="unix://$socket_path"
     fi
+  fi
+  desktop_socket="${AGMSG_CODEX_DESKTOP_SOCKET:-${HOME:-}/.codex/ipc/ipc.sock}"
+  if [ -z "$app_server" ] && [ -S "$desktop_socket" ]; then
+    app_server="desktop://$desktop_socket"
   fi
   [ -n "$app_server" ] || exit 0
 
@@ -181,6 +135,10 @@ EOF
   else
     bridge_run=("$(agmsg_resolve_node)" "$SKILL_DIR/scripts/drivers/types/codex/codex-bridge.js")
   fi
+  transport_args=(--app-server "$app_server")
+  case "$app_server" in
+    desktop://*) transport_args=(--desktop-ipc "${app_server#desktop://}") ;;
+  esac
   local storage_dir
   storage_dir="$(agmsg_storage_dir)"
   # The bridge outlives this hook, so it must not carry the harness's
@@ -207,7 +165,7 @@ EOF
       --type "$TYPE" \
       "${bridge_pairs[@]}" \
       --thread "$thread_id" \
-      --app-server "$app_server" \
+      "${transport_args[@]}" \
       --inline-inbox \
       >>"$log" 2>&1 3>&- 4>&- &
   )

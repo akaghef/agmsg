@@ -373,12 +373,13 @@ JSON
 
 @test "watch: actas watcher from a subdir does not exit with no-registration" {
   reg T alice "$ROOT"
+  bash "$SKILL_DIR/scripts/actas-claim.sh" "$ROOT" claude-code alice sid-w >/dev/null
   # Launch the actas watcher (ACTIVE_NAME=alice) from a subdir; without
   # resolution it would see no registration and exit immediately.
   bash "$SKILL_DIR/scripts/watch.sh" sid-w "$ROOT/sub/deep" claude-code alice \
     >"$BATS_TEST_TMPDIR/w.out" 2>&1 3>&- &
   local wpid=$!
-  sleep 1
+  wait_for_file "$RUN_DIR/ready.T__alice"
   # A resolving watcher is still alive in its poll loop; an unresolved one has
   # already exited.
   local alive=0

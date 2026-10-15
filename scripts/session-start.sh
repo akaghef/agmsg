@@ -55,23 +55,6 @@ source "$SCRIPT_DIR/lib/close-fds.sh"
 PAIRS=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null || true)
 [ -n "$PAIRS" ] || exit 0
 
-# Type-specific SessionStart behaviour (Template Method). A type may ship
-# scripts/drivers/types/<type>/_session-start.sh defining agmsg_session_start to override the
-# default no-op — codex uses it to hand the session off to the bridge. The plug
-# is sourced in this script's context so it sees PROJECT / RUN_DIR / SKILL_DIR /
-# PAIRS and the helpers sourced above; it may exit 0 (codex does, having no
-# Monitor tool) to skip the Monitor-directive path below.
-agmsg_session_start_default() { :; }
-
-_tdir="$(agmsg_type_dir "$TYPE" 2>/dev/null || true)"
-if [ -n "$_tdir" ] && [ -f "$_tdir/_session-start.sh" ]; then
-  # shellcheck disable=SC1090
-  . "$_tdir/_session-start.sh"
-  agmsg_session_start
-else
-  agmsg_session_start_default
-fi
-
 # Read hook input JSON from stdin. The session id field name differs by vendor:
 # Claude Code emits snake_case "session_id"; Grok Build (and Cursor) emit
 # camelCase "sessionId". Try snake first (claude-code unaffected), then camel,
@@ -89,6 +72,55 @@ fi
 [ -z "$SESSION_ID" ] && SESSION_ID="${GROK_SESSION_ID:-}"
 # Fallback so the instruction is still actionable even outside a hook flow.
 [ -z "$SESSION_ID" ] && SESSION_ID="unknown-$$"
+[ "$TYPE" != codex ] || SESSION_ID="${CODEX_THREAD_ID:-}"
+# /clear changes the native Claude session while retaining its process. Retire
+# only that process's previous membership before the new, unbound session exits.
+if [ "$TYPE" = claude-code ]; then
+  CC_PID="$(agmsg_agent_pid "$TYPE" 2>/dev/null || true)"
+  if [ -n "$CC_PID" ]; then
+    INSTANCE_ID="$(agmsg_instance_id_from_pid "$SESSION_ID" "$CC_PID")"
+    STATE="$RUN_DIR/cc-instance.$CC_PID"
+    prev="$(cat "$STATE" 2>/dev/null || true)"
+    if [ -n "$prev" ] && [ "$prev" != "$INSTANCE_ID" ]; then
+      agmsg_role_active_release_all "$TYPE" "$(agmsg_instance_bare_sid "$prev")" "$prev"
+      actas_lock_release_all "$prev" || true
+      prev_pidfile="$RUN_DIR/watch.$prev.pid"
+      prev_pid="$(cat "$prev_pidfile" 2>/dev/null || true)"
+      if [ -n "$prev_pid" ] && _agmsg_pid_alive_local "$prev_pid"; then
+        cmd="$(compat_get_cmdline "$prev_pid" 2>/dev/null || true)"
+        agmsg_cmdline_names_path "$cmd" "$SKILL_DIR/scripts/watch.sh" && kill "$prev_pid" 2>/dev/null || true
+      fi
+    fi
+    mkdir -p "$RUN_DIR"
+    printf '%s\n' "$INSTANCE_ID" > "$STATE"
+  fi
+fi
+# Filter before vendor startup, unread output, or any monitor directive. Resume
+# history is deliberately excluded: a resumed context must explicitly rejoin.
+source "$SCRIPT_DIR/lib/subscription.sh"
+SESSION_OWNER="$(agmsg_normalize_instance_id "$SESSION_ID" "$TYPE" 2>/dev/null)"
+[ "$TYPE" != codex ] || SESSION_OWNER="$SESSION_ID"
+PAIRS="$(agmsg_subscription_pairs "$PROJECT" "$TYPE" "$SESSION_OWNER" 2>/dev/null)"
+[ -n "$PAIRS" ] || exit 0
+
+# Type-specific SessionStart behaviour (Template Method). A type may ship
+# scripts/drivers/types/<type>/_session-start.sh defining agmsg_session_start to override the
+# default no-op — codex uses it to hand the session off to the bridge. The plug
+# is sourced in this script's context so it sees PROJECT / RUN_DIR / SKILL_DIR /
+# PAIRS and the helpers sourced above; it may exit 0 (codex does, having no
+# Monitor tool) to skip the Monitor-directive path below.
+agmsg_session_start_default() { :; }
+
+_tdir="$(agmsg_type_dir "$TYPE" 2>/dev/null || true)"
+if [ -n "$_tdir" ] && [ -f "$_tdir/_session-start.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$_tdir/_session-start.sh"
+  agmsg_session_start
+else
+  agmsg_session_start_default
+fi
+
+
 
 # --- Skip spawned worktree sub-sessions (.claude/worktrees checkouts). ---
 # Claude Code's background-task feature runs a short-lived sub-session in an
@@ -303,33 +335,17 @@ if [ -f "$WATCHER_PIDFILE" ]; then
   existing=$(cat "$WATCHER_PIDFILE" 2>/dev/null || true)
   if [ -n "$existing" ] && _agmsg_pid_alive_local "$existing"; then
     cat <<EOF
-AGMSG monitor mode: a watch.sh is already streaming for this session (pid $existing).
+AGMSG monitor mode: a watch.sh is already streaming for this session.
 No action needed — the existing watcher is the active one.
 EOF
     exit 0
   fi
 fi
 
-# --- Role-aware resume (#339). ---
-# If this session's bare sid was recorded as a role's seat (by actas-claim, or
-# codex actas), and that (team, agent) is registered for THIS project, emit the
-# ROLE-FILTERED directive instead of the generic unfiltered one: watch.sh with a
-# 4th <agent> arg restricts receive to that role AND re-claims its exclusivity
-# lock. This covers a manual `claude --resume <uuid>` that bypasses spawn's actas
-# boot prompt -- the resumed session re-arms as its role automatically. Fail-open:
-# no record, no project match, or an unreadable record => generic directive.
+# The directive may name a role only after the ACTIVE subscription gate.
 ROLE_NAME=""; ROLE_TEAM=""
-_bare_sid="$(agmsg_instance_bare_sid "$SESSION_ID" 2>/dev/null || printf '%s' "$SESSION_ID")"
-_rec="$(agmsg_role_session_lookup_by_sid "$_bare_sid" 2>/dev/null || true)"
-if [ -n "$_rec" ]; then
-  _r_agent="$(printf '%s\n' "$_rec" | sed -n 's/^agent=//p' | head -1)"
-  _r_team="$(printf '%s\n' "$_rec" | sed -n 's/^team=//p' | head -1)"
-  # Guard against a cross-project sid collision: only honor the record when its
-  # (team, agent) is actually one of this project's registered pairs.
-  if [ -n "$_r_agent" ] && [ -n "$_r_team" ] \
-     && printf '%s\n' "$PAIRS" | grep -Fxq "$(printf '%s\t%s' "$_r_team" "$_r_agent")"; then
-    ROLE_NAME="$_r_agent"; ROLE_TEAM="$_r_team"
-  fi
+if [ "$(printf '%s\n' "$PAIRS" | cut -f2 | sort -u | wc -l | tr -d ' ')" = 1 ]; then
+  IFS=$'\t' read -r ROLE_TEAM ROLE_NAME <<< "$PAIRS"
 fi
 
 WATCH="$SKILL_DIR/scripts/watch.sh"
@@ -340,17 +356,16 @@ WATCH="$SKILL_DIR/scripts/watch.sh"
 if [ -n "$ROLE_NAME" ]; then
   WATCH_COMMAND="$(printf '%q %q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE" "$ROLE_NAME")"
   cat <<EOF
-AGMSG monitor mode (resumed role \`$ROLE_NAME\` in team \`$ROLE_TEAM\`): this
-session was recorded as that role's seat, so invoke the Monitor tool now with the
+AGMSG monitor mode (active role \`$ROLE_NAME\` in team \`$ROLE_TEAM\`): this
+session explicitly joined that role, so invoke the Monitor tool now with the
 following parameters, before any other action in this session.
 
   command: $WATCH_COMMAND
   description: agmsg inbox stream (acting as $ROLE_NAME)
   persistent: true
 
-The 4th argument restricts receive to \`$ROLE_NAME\` only and re-claims its actas
-exclusivity lock — a resume restores context but not runtime state, so this
-re-establishes the role. Send with \`send.sh ... $ROLE_NAME ...\` (this session's
+The 4th argument restricts receive to \`$ROLE_NAME\` only. Membership remains
+active until leave or session end. Send with \`send.sh ... $ROLE_NAME ...\` (this session's
 active FROM is \`$ROLE_NAME\`). Each output line is one message:
 \`<ts> | <team> | <from> → <to> | <body>\`. React as they arrive.
 

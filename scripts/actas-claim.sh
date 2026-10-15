@@ -46,7 +46,13 @@ PROJECT="$(agmsg_resolve_project "$PROJECT" "$TYPE")"
 # watcher (re)launched by this actas flow keys its pidfile on. The template
 # passes a bare $CLAUDE_CODE_SESSION_ID; normalize self-derives the composite so
 # a parallel --continue/--resume session can't appear to already own the role.
-SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$TYPE")"
+if [ "$TYPE" = codex ]; then
+  [ -n "${CODEX_THREAD_ID:-}" ] && [ "$CODEX_THREAD_ID" = "$SESSION_ID" ] || { echo status=unbound; exit 1; }
+else
+  SESSION_ID="$(agmsg_normalize_instance_id "$SESSION_ID" "$TYPE")"
+fi
+BARE_SID="$(agmsg_instance_bare_sid "$SESSION_ID")"
+PROJECT_PHYS="$(agmsg_canonical_path "$PROJECT")"
 
 # Find the team(s) this name is registered to for the given project/type.
 TEAMS=""
@@ -67,19 +73,25 @@ fi
 claimed=""
 while IFS= read -r team; do
   [ -z "$team" ] && continue
-  result=$(actas_lock_claim "$team" "$NAME" "$SESSION_ID" 2>/dev/null || true)
+  already_active=0
+  agmsg_role_active_matches "$team" "$NAME" "$TYPE" "$BARE_SID" "$PROJECT_PHYS" "$SESSION_ID" && already_active=1
+  if result=$(agmsg_role_active_claim "$team" "$NAME" "$BARE_SID" "$PROJECT_PHYS" "$TYPE" "$SESSION_ID" 2>/dev/null); then
+    :
+  else
+    [ -n "$result" ] || result="failed"
+  fi
   case "$result" in
-    held:*)
+    held:*|failed)
       # Roll back any partial claims so the user can retry cleanly.
       while IFS= read -r c_team; do
         [ -z "$c_team" ] && continue
-        actas_lock_release "$c_team" "$NAME" "$SESSION_ID" 2>/dev/null || true
+        agmsg_role_active_release "$c_team" "$NAME" "$TYPE" "$BARE_SID" "$SESSION_ID" 2>/dev/null || true
       done <<< "$claimed"
       printf 'status=held team=%s owner=%s\n' "$team" "${result#held:}"
       exit 1
       ;;
   esac
-  claimed="${claimed:+$claimed$'\n'}$team"
+  [ "$already_active" = 1 ] || claimed="${claimed:+$claimed$'\n'}$team"
 done <<< "$TEAMS"
 
 # All teams claimed. Record (team, agent) -> bare session id for each, so this

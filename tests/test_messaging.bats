@@ -175,8 +175,9 @@ line3"
   local project; project="$(mktemp -d)"
   bash "$SCRIPTS/join.sh" "te'am" alice claude-code /tmp/project-a
   bash "$SCRIPTS/join.sh" "te'am" carol claude-code "$project"
+  AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/actas-claim.sh" "$project" claude-code carol quoted-team-session >/dev/null
   bash "$SCRIPTS/send.sh" "te'am" alice carol "quoted team delivery"
-  run bash -c "echo '{}' | bash '$SCRIPTS/check-inbox.sh' claude-code '$project'"
+  run bash -c "echo '{\"session_id\":\"quoted-team-session\"}' | AGMSG_RESOLVE_PROJECT=0 bash '$SCRIPTS/check-inbox.sh' claude-code '$project'"
   [ "$status" -eq 0 ]
   [[ "$output" =~ "quoted team delivery" ]]
 }

@@ -9,11 +9,37 @@ setup() {
   # when the suite runs under an agent process. Composite path: test_watch.bats.
   export AGMSG_AGENT_PID=""
   export TEST_PROJECT="$(mktemp -d)"
+  DELIVERY_FIXTURE_PIDS=""
 }
 
 teardown() {
+  local pid
+  for pid in $DELIVERY_FIXTURE_PIDS; do
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
   teardown_test_env
   rm -rf "$TEST_PROJECT"
+}
+
+# Delivery regressions explicitly seat their native session; registration and
+# advisory resume history alone must never authorize a watcher or hook.
+_activate_role() {
+  local team="$1" agent="$2" sid="$3" proj="$4" type="${5:-claude-code}" owner="${6:-$3}"
+  # Bare Claude fixture identities need a live instance record, exactly as a
+  # real SessionStart provides. Keep dead composite owners dead for log tests.
+  if [ "$type" = claude-code ] && [ "$owner" = "$sid" ]; then
+    sleep 600 >/dev/null 2>&1 3>&- &
+    local fixture_pid=$!
+    DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$fixture_pid"
+    mkdir -p "$TEST_SKILL_DIR/run"
+    printf '%s\n' "$sid" > "$TEST_SKILL_DIR/run/cc-instance.$fixture_pid"
+  fi
+  SKILL_DIR="$TEST_SKILL_DIR" bash -c '
+    source "$1/lib/role-session.sh"
+    source "$1/lib/resolve-project.sh"
+    agmsg_role_active_claim "$2" "$3" "$4" "$(agmsg_canonical_path "$5")" "$6" "$7"
+  ' _ "$SCRIPTS" "$team" "$agent" "$sid" "$proj" "$type" "$owner" >/dev/null
 }
 
 # Count agmsg-owned entries in a hooks-event array.
@@ -481,7 +507,8 @@ eperm_pid() {
   local sp="$TEST_PROJECT/Mobile Documents/o'brien proj"
   mkdir -p "$sp"
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$sp" >/dev/null
-  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$sp" </dev/null
+  _activate_role team alice argv-session "$sp"
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< '{"session_id":"argv-session"}'
   [ "$status" -eq 0 ]
   [[ "$output" =~ "invoke the Monitor tool" ]]
   local cmdline
@@ -535,10 +562,12 @@ eperm_pid() {
   # separately in tests/test_sync_autostart.bats.
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
 
+  _activate_role team alice sync-session "$TEST_PROJECT"
+
   # NEGATIVE FIRST, on the state every ordinary machine is in: no connected
   # team at all. A line printed unconditionally would pass the positive half
   # below and be wrong every single session.
-  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<< '{"session_id":"sync-session"}'
   [ "$status" -eq 0 ]
   refute grep -qF -- "connected, but not syncing" <<<"$output"
 
@@ -575,7 +604,7 @@ eperm_pid() {
   } > "$SCRIPTS/remote.sh"
   chmod +x "$SCRIPTS/remote.sh"
 
-  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<< '{"session_id":"sync-session"}'
   [ "$status" -eq 0 ]
   printf '%s\n' "$output" | grep -q -F -- "connected, but not syncing"
   # The printed COMMAND must be runnable, not a template. Scoped to the command
@@ -617,7 +646,7 @@ eperm_pid() {
   local spaced="$BATS_TEST_TMPDIR/an install/skill"
   mkdir -p "$spaced"
   cp -R "$TEST_SKILL_DIR/." "$spaced/"
-  run env AGMSG_RESOLVE_PROJECT=0 bash "$spaced/scripts/session-start.sh" claude-code "$TEST_PROJECT" </dev/null
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$spaced/scripts/session-start.sh" claude-code "$TEST_PROJECT" <<< '{"session_id":"sync-session"}'
   [ "$status" -eq 0 ]
   local spaced_cmd
   spaced_cmd="$(printf '%s\n' "$output" | sed -n 's/^  bash //p' | head -1)"
@@ -663,47 +692,36 @@ _seed_role_record() {
   ' _ "$SCRIPTS" "$team" "$agent" "$sid" "$proj" "$type"
 }
 
-@test "session-start: a resumed role's sid emits the role-filtered directive (#339)" {
+@test "session-start: an ACTIVE role emits the role-filtered directive" {
   local sp="$TEST_PROJECT"
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$sp" >/dev/null
   _seed_role_record team alice "sid-resumed" "$sp" claude-code
+  _activate_role team alice sid-resumed "$sp"
 
   run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< '{"session_id":"sid-resumed"}'
   [ "$status" -eq 0 ]
-  [[ "$output" == *"resumed role"* ]]
-  [[ "$output" == *"acting as alice"* ]]
+  [[ "$output" == *"active role"* ]]
+  [[ "$output" == *"alice"* ]]
   # The 4th watch.sh arg restricts receive to the role.
   local cmdline; cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
   eval "set -- $cmdline"
   [ "$5" = "alice" ]
 }
 
-@test "session-start: an unrecorded sid emits the generic directive (#339)" {
-  local sp="$TEST_PROJECT"
-  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$sp" >/dev/null
-  # no record for this sid
-
-  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< '{"session_id":"sid-unknown"}'
+@test "session-start: an unbound native session receives no directive" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<< '{"session_id":"sid-unknown"}'
   [ "$status" -eq 0 ]
-  [[ "$output" != *"resumed role"* ]]
-  [[ "$output" == *"invoke the Monitor tool"* ]]
-  # Generic directive: watch.sh has no 4th (role) arg.
-  local cmdline; cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
-  eval "set -- $cmdline"
-  [ "$#" -eq 4 ]
+  [ -z "$output" ]
 }
 
-@test "session-start: a record for a role not registered here is ignored (#339)" {
-  local sp="$TEST_PROJECT"
-  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$sp" >/dev/null
-  # Same sid, but recorded for a (team, agent) that is NOT registered in this
-  # project -- a cross-project sid collision must not mis-seat this session.
-  _seed_role_record team ghost "sid-resumed" "/some/other/proj" claude-code
-
-  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$sp" <<< '{"session_id":"sid-resumed"}'
+@test "session-start: historical resume records do not authorize delivery" {
+  env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
+  _seed_role_record team alice sid-resumed "$TEST_PROJECT" claude-code
+  _seed_role_record team ghost sid-resumed /some/other/proj claude-code
+  run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<< '{"session_id":"sid-resumed"}'
   [ "$status" -eq 0 ]
-  [[ "$output" != *"resumed role"* ]]
-  [[ "$output" == *"invoke the Monitor tool"* ]]
+  [ -z "$output" ]
 }
 
 @test "delivery set turn: emits AGMSG-DIRECTIVE to stop any running watcher" {
@@ -728,10 +746,11 @@ _seed_role_record() {
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
+  _activate_role myteam alice stop-test "$TEST_PROJECT"
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-test "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
-  [ -f "$TEST_SKILL_DIR/run/watch.stop-test.pid" ]
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$watch_pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.stop-test.pid"
   run bash "$SCRIPTS/delivery.sh" stop
   [[ "$output" =~ "Killed 1 watch" ]]
   [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
@@ -781,10 +800,11 @@ JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
   # A live claude-code watcher for this project.
+  _activate_role myteam alice cc-sess "$TEST_PROJECT"
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
-  [ -f "$TEST_SKILL_DIR/run/watch.cc-sess.pid" ]
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$watch_pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.cc-sess.pid"
   # Switching a DIFFERENT type's delivery in the SAME project must not touch it.
   run bash "$SCRIPTS/delivery.sh" set turn copilot "$TEST_PROJECT"
   [ "$status" -eq 0 ]
@@ -799,10 +819,11 @@ JSON
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
+  _activate_role myteam alice cc-sess2 "$TEST_PROJECT"
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" cc-sess2 "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
-  [ -f "$TEST_SKILL_DIR/run/watch.cc-sess2.pid" ]
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$watch_pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.cc-sess2.pid"
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [ ! -f "$TEST_SKILL_DIR/run/watch.cc-sess2.pid" ]
@@ -821,10 +842,11 @@ JSON
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$sp"}]}}}
 JSON
+  _activate_role myteam alice sp-sess "$sp"
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sp-sess "$sp" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
-  [ -f "$TEST_SKILL_DIR/run/watch.sp-sess.pid" ]
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$watch_pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sp-sess.pid"
   # Another type's set turn in the SAME space-containing project: must NOT kill it.
   run bash "$SCRIPTS/delivery.sh" set turn copilot "$sp"
   [ "$status" -eq 0 ]
@@ -847,10 +869,11 @@ JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
 
+  _activate_role myteam alice sigterm-test "$TEST_PROJECT"
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sigterm-test "$TEST_PROJECT" claude-code 3>&- &
   local pid=$!
-  sleep 1
-  [ -f "$TEST_SKILL_DIR/run/watch.sigterm-test.pid" ]
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sigterm-test.pid"
   kill -TERM "$pid"
   sleep 1
   refute kill -0 "$pid" 2>/dev/null
@@ -860,6 +883,7 @@ JSON
 # --- session-start.sh: skip worktree sub-sessions (#367) ---
 
 @test "session-start: skips the Monitor directive when hook cwd is under .claude/worktrees/" {
+  _activate_role team alice sid-sub "$TEST_PROJECT"
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
   local sub_cwd="$TEST_PROJECT/.claude/worktrees/bg-task-1"
   run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<< "{\"session_id\":\"sid-sub\",\"cwd\":\"$sub_cwd\"}"
@@ -869,6 +893,7 @@ JSON
 }
 
 @test "session-start: skips when hook cwd uses escaped-backslash (Windows JSON) separators" {
+  _activate_role team alice sid-sub-win "$TEST_PROJECT"
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
   run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<< '{"session_id":"sid-sub-win","cwd":"C:\\proj\\.claude\\worktrees\\bg-1"}'
   [ "$status" -eq 0 ]
@@ -876,6 +901,7 @@ JSON
 }
 
 @test "session-start: falls back to \$PWD for the worktree check when the hook input has no cwd" {
+  _activate_role team alice sid-sub-nocwd "$TEST_PROJECT"
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
   local sub_cwd="$TEST_PROJECT/.claude/worktrees/bg-task-2"
   mkdir -p "$sub_cwd"
@@ -885,6 +911,7 @@ JSON
 }
 
 @test "session-start: still emits the Monitor directive for a normal (non-worktree) cwd" {
+  _activate_role team alice sid-normal "$TEST_PROJECT"
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
   run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<< "{\"session_id\":\"sid-normal\",\"cwd\":\"$TEST_PROJECT\"}"
   [ "$status" -eq 0 ]
@@ -892,6 +919,7 @@ JSON
 }
 
 @test "session-start: does NOT skip a project whose path merely contains 'claude' and 'worktrees' loosely" {
+  _activate_role team alice sid-decoy "$TEST_PROJECT"
   # Regression guard: a naive *.claude*worktrees* glob would also match
   # unrelated project names like .claude-tools/my-worktrees-app, which don't
   # form the actual .claude/worktrees path segment sequence.
@@ -937,6 +965,7 @@ JSON
 }
 
 @test "session-start.sh cleans stale cc-instance files for dead CC pids" {
+  _activate_role myteam alice x "$TEST_PROJECT"
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
@@ -957,6 +986,7 @@ JSON
 # assert through that. (Exercised via claude-code since the resolver is shared.)
 
 @test "session-start: resolves camelCase sessionId from stdin (grok/cursor field)" {
+  _activate_role team alice grokCamelSID "$TEST_PROJECT"
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
   run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<<'{"sessionId":"grokCamelSID"}'
@@ -968,6 +998,7 @@ JSON
 }
 
 @test "session-start: falls back to GROK_SESSION_ID env when stdin lacks a session id" {
+  _activate_role team alice grokEnvSID "$TEST_PROJECT"
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
   run env AGMSG_RESOLVE_PROJECT=0 GROK_SESSION_ID=grokEnvSID bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<<'{}'
@@ -979,6 +1010,7 @@ JSON
 }
 
 @test "session-start: snake_case session_id still wins over camelCase (claude-code unaffected)" {
+  _activate_role team alice snakeWins "$TEST_PROJECT"
   env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/join.sh" team alice claude-code "$TEST_PROJECT" >/dev/null
   bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT" >/dev/null
   run env AGMSG_RESOLVE_PROJECT=0 bash "$SCRIPTS/session-start.sh" claude-code "$TEST_PROJECT" <<<'{"session_id":"snakeWins","sessionId":"camelLoses"}'
@@ -1010,9 +1042,11 @@ has_session_end() {
   has_check_inbox   "$(settings_file)"
 }
 
-@test "delivery set turn: no SessionEnd installed" {
+@test "delivery set turn: installs SessionEnd for matching-owner cleanup" {
   bash "$SCRIPTS/delivery.sh" set turn claude-code "$TEST_PROJECT"
-  ! has_session_end "$(settings_file)"
+  has_session_end "$(settings_file)"
+  ! has_session_start "$(settings_file)"
+  has_check_inbox "$(settings_file)"
 }
 
 @test "delivery set off: removes SessionEnd along with other entries" {
@@ -1101,6 +1135,7 @@ has_session_end() {
 # --- session-start.sh: stale watcher pidfile cleanup ---
 
 @test "session-start.sh removes watch.<sid>.pid files whose pid is dead" {
+  _activate_role myteam alice x "$TEST_PROJECT"
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
@@ -1125,6 +1160,7 @@ JSON
 # this one binds NO cc-instance record, so only the sweep itself -- not the
 # separate dead-cc-instance passes above it -- decides the outcome.
 @test "session-start.sh: stale-pidfile sweep keeps a live watcher pidfile tasklist cannot see (#567-style regression)" {
+  _activate_role myteam alice x "$TEST_PROJECT"
   skip_on_windows "stubs tasklist to model Git Bash; the real one is authoritative there"
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
@@ -1155,6 +1191,7 @@ JSON
 # actual environment the bug was found in rather than a model of it. No
 # cc-instance binding here either, for the same isolation reason.
 @test "session-start.sh: stale-pidfile sweep keeps a live watcher pidfile under real Git Bash (#567-style regression, native Windows only)" {
+  _activate_role myteam alice x "$TEST_PROJECT"
   skip_unless_windows "exercises the real MSYS pid space and real tasklist"
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
@@ -1176,6 +1213,7 @@ JSON
 }
 
 @test "session-start.sh leaves alive watcher pidfiles alone (when bound to a live CC instance)" {
+  _activate_role myteam alice x "$TEST_PROJECT"
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
@@ -1254,12 +1292,10 @@ JSON
   unset CLAUDE_CODE_SESSION_ID
 }
 
-@test "session-start.sh for codex matches rollout cwd via a symlinked project path (#160)" {
+@test "session-start.sh for codex matches ACTIVE membership via a symlinked project path" {
   skip_on_windows "codex bridge launch and symlink path on Windows (#182)"
-  # agmsg opens the project through a symlink (linkproj), but Codex records the
-  # canonical/physical cwd (realproj) in session_meta. A raw string compare
-  # misses the rollout, so the thread never resolves and the bridge never
-  # starts. With physical-path canonicalization the two reconcile.
+  # Registration uses a symlink while ACTIVE membership stores the physical
+  # project path. The native thread must still resolve this one membership.
   local realproj="$TEST_PROJECT/realproj"
   local linkproj="$TEST_PROJECT/linkproj"
   mkdir -p "$realproj"
@@ -1268,7 +1304,7 @@ JSON
   phys=$(cd "$realproj" && pwd -P)
 
   bash "$SCRIPTS/join.sh" team alice codex "$linkproj" >/dev/null
-  _seed_role_record team alice thread-sym "$linkproj" codex
+  _activate_role team alice thread-sym "$linkproj" codex
 
   # Stage a Codex rollout whose session_meta records the PHYSICAL cwd.
   local sdir="$HOME/.codex/sessions/2026/06/19"
@@ -1284,14 +1320,12 @@ printf '%s\n' "$*" >> "$AGMSG_TEST_LOG"
 EOF
   chmod +x "$fake"
 
-  # env -u CODEX_THREAD_ID forces the rollout-scan fallback that does the
-  # compare — without it, a CODEX_THREAD_ID inherited from the parent env (e.g.
-  # running the suite inside a Codex session) short-circuits the resolver and
-  # this test never exercises the path it's meant to cover.
+  # The current native thread is explicit; project canonicalization still
+  # reconciles the symlink registration with its physical membership path.
   AGMSG_CODEX_BRIDGE_APP_SERVER="unix://$TEST_SKILL_DIR/run/codex-app-server.test.sock" \
   AGMSG_CODEX_BRIDGE_CMD="$fake" \
   AGMSG_TEST_LOG="$log" \
-    env -u CODEX_THREAD_ID bash "$SCRIPTS/session-start.sh" codex "$linkproj" >/dev/null
+    env CODEX_THREAD_ID=thread-sym bash "$SCRIPTS/session-start.sh" codex "$linkproj" >/dev/null
 
   for _ in {1..20}; do
     [ -f "$log" ] && break
@@ -1498,8 +1532,10 @@ JSON
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'alice', 'for-alice');"
   sqlite3 "$DB" "INSERT INTO messages (team, from_agent, to_agent, body) VALUES ('myteam', 'system', 'bob', 'for-bob');"
 
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-sid "$TEST_PROJECT" claude-code bob > /tmp/agmsg-as-bob 2>&1 3>&- &
+  _activate_role myteam bob t-sid "$TEST_PROJECT"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-sid "$TEST_PROJECT" claude-code bob > "$TEST_SKILL_DIR/agmsg-as-bob" 2>&1 3>&- &
   local pid=$!
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$pid"
   # The watcher seeds its cursor from the storage tip at startup, so prior
   # messages aren't replayed. Send NEW messages through the facade (storage_send
   # writes the event log the watcher now streams) and wait for several polls.
@@ -1510,9 +1546,9 @@ JSON
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
 
-  grep -q "new-for-bob"   /tmp/agmsg-as-bob
-  ! grep -q "new-for-alice" /tmp/agmsg-as-bob
-  rm -f /tmp/agmsg-as-bob
+  grep -q "new-for-bob"   "$TEST_SKILL_DIR/agmsg-as-bob"
+  ! grep -q "new-for-alice" "$TEST_SKILL_DIR/agmsg-as-bob"
+  rm -f "$TEST_SKILL_DIR/agmsg-as-bob"
 }
 
 @test "watch.sh exits when active_name is not registered" {
@@ -1527,6 +1563,7 @@ JSON
 # --- session-start.sh orphan watcher cleanup ---
 
 @test "session-start.sh kills orphan watchers whose owning CC instance is gone" {
+  _activate_role myteam alice current-sid "$TEST_PROJECT"
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
@@ -1566,6 +1603,7 @@ JSON
 }
 
 @test "session-start.sh does NOT kill a watcher when its session_id is still live under a different CC pid" {
+  _activate_role myteam alice x "$TEST_PROJECT"
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
@@ -1592,24 +1630,26 @@ JSON
   kill "$watcher_pid" 2>/dev/null || true
 }
 
-@test "watch.sh subscription is static — newly joined identities don't appear in a running watcher" {
+@test "watch.sh does not deliver to a newly registered unbound role" {
   mkdir -p "$TEST_SKILL_DIR/teams/myteam"
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
   DB="$TEST_SKILL_DIR/db/messages.db"
 
-  # Watcher starts with only `alice` registered. Default subscription set
-  # is resolved at launch and not re-evaluated each poll.
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-static "$TEST_PROJECT" claude-code > /tmp/agmsg-static 2>&1 3>&- &
+  # Only alice belongs to this native session. Registering another role must
+  # not expand the watcher's ACTIVE membership.
+  _activate_role myteam alice t-static "$TEST_PROJECT"
+  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" t-static "$TEST_PROJECT" claude-code > "$TEST_SKILL_DIR/agmsg-static" 2>&1 3>&- &
   local pid=$!
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$pid"
   sleep 1
 
   # Join `bob` to the same (project, type) after the watcher is running.
   bash "$SCRIPTS/join.sh" myteam bob claude-code "$TEST_PROJECT"
 
   # Send messages for both via the facade. alice should arrive (alice was in the
-  # original subscription set); bob should NOT arrive (joined after launch).
+  # ACTIVE membership); bob should NOT arrive (registered but unbound).
   bash "$SCRIPTS/send.sh" myteam sys alice "for-alice-static" --force >/dev/null
   bash "$SCRIPTS/send.sh" myteam sys bob   "for-bob-static" --force >/dev/null
 
@@ -1617,9 +1657,9 @@ JSON
   kill -TERM "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null || true
 
-  grep -q "for-alice-static" /tmp/agmsg-static
-  refute grep -q "for-bob-static" /tmp/agmsg-static
-  rm -f /tmp/agmsg-static
+  grep -q "for-alice-static" "$TEST_SKILL_DIR/agmsg-static"
+  refute grep -q "for-bob-static" "$TEST_SKILL_DIR/agmsg-static"
+  rm -f "$TEST_SKILL_DIR/agmsg-static"
 }
 
 # --- set turn/off is project-scoped: must not kill other projects' watchers ---
@@ -1638,13 +1678,16 @@ JSON
 {"name":"team-b","agents":{"bob":{"registrations":[{"type":"claude-code","project":"$proj_b"}]}}}
 JSON
 
+  _activate_role team-a alice sid-a "$proj_a"
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sid-a "$proj_a" claude-code 3>&- &
   local pid_a=$!
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$pid_a"
+  _activate_role team-b bob sid-b "$proj_b"
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" sid-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
-  sleep 1
-  [ -f "$TEST_SKILL_DIR/run/watch.sid-a.pid" ]
-  [ -f "$TEST_SKILL_DIR/run/watch.sid-b.pid" ]
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$pid_b"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sid-a.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.sid-b.pid"
 
   run bash "$SCRIPTS/delivery.sh" set turn claude-code "$proj_a"
   [ "$status" -eq 0 ]
@@ -1676,11 +1719,16 @@ JSON
 {"name":"team-b","agents":{"bob":{"registrations":[{"type":"claude-code","project":"$proj_b"}]}}}
 JSON
 
+  _activate_role team-a alice off-a "$proj_a"
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" off-a "$proj_a" claude-code 3>&- &
   local pid_a=$!
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$pid_a"
+  _activate_role team-b bob off-b "$proj_b"
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" off-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
-  sleep 1
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$pid_b"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.off-a.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.off-b.pid"
 
   run bash "$SCRIPTS/delivery.sh" set off claude-code "$proj_a"
   [ "$status" -eq 0 ]
@@ -1708,11 +1756,16 @@ JSON
 {"name":"team-b","agents":{"bob":{"registrations":[{"type":"claude-code","project":"$proj_b"}]}}}
 JSON
 
+  _activate_role team-a alice stop-a "$proj_a"
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-a "$proj_a" claude-code 3>&- &
   local pid_a=$!
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$pid_a"
+  _activate_role team-b bob stop-b "$proj_b"
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" stop-b "$proj_b" claude-code 3>&- &
   local pid_b=$!
-  sleep 1
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$pid_b"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.stop-a.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.stop-b.pid"
 
   run bash "$SCRIPTS/delivery.sh" stop
   [[ "$output" =~ "Killed 2 watch" ]]
@@ -2138,7 +2191,7 @@ JSON
 # --- Codex monitor bridge (#41) ---
 @test "session-start.sh for codex starts bridge when monitor launcher env is present" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
-  _seed_role_record team alice thread-123 "$TEST_PROJECT" codex
+  _activate_role team alice thread-123 "$TEST_PROJECT" codex
   local fake="$TEST_SKILL_DIR/fake-codex-bridge"
   local log="$TEST_SKILL_DIR/fake-codex-bridge.log"
   cat >"$fake" <<'EOF'
@@ -2168,7 +2221,8 @@ EOF
   grep -q -- "--inline-inbox" "$log"
 }
 
-@test "session-start.sh for codex stays quiet without monitor launcher env" {
+@test "session-start.sh for codex stays quiet without an available transport" {
+  _activate_role team alice thread-123 "$TEST_PROJECT" codex
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
   local fake="$TEST_SKILL_DIR/fake-codex-bridge"
   local log="$TEST_SKILL_DIR/fake-codex-bridge.log"
@@ -2492,7 +2546,7 @@ EOF
   [[ "$output" != *"watch processes:"* ]]
 }
 
-@test "session-start.sh for codex resolves thread id from rollout when CODEX_THREAD_ID is unset" {
+@test "session-start.sh for codex rejects rollout-only identity when CODEX_THREAD_ID is unset" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
   _seed_role_record team alice rollout-thread-999 "$TEST_PROJECT" codex
   local fake="$TEST_SKILL_DIR/fake-codex-bridge"
@@ -2503,8 +2557,8 @@ printf '%s\n' "$*" >> "$AGMSG_TEST_LOG"
 EOF
   chmod +x "$fake"
 
-  # Fresh/exec Codex sessions do not export CODEX_THREAD_ID; the hook must read
-  # the thread id from the newest rollout whose session_meta cwd matches (#41).
+  # A matching historical rollout must not authorize a caller with no native
+  # CODEX_THREAD_ID. The unread role stays available to its explicit owner.
   local rollout_dir="$TEST_SKILL_DIR/home/.codex/sessions/2026/06/17"
   mkdir -p "$rollout_dir"
   printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"id\":\"rollout-thread-999\",\"cwd\":\"$TEST_PROJECT\"}}" \
@@ -2517,12 +2571,10 @@ EOF
   AGMSG_TEST_LOG="$log" \
     env -u CODEX_THREAD_ID bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null
 
-  for _ in {1..20}; do [ -f "$log" ] && break; sleep 0.1; done
-  [ -f "$log" ]
-  grep -q -- "--thread rollout-thread-999" "$log"
+  [ ! -f "$log" ]
 }
 
-@test "session-start.sh for codex resolves the rollout by real mtime, not filename order (#416)" {
+@test "session-start.sh for codex never selects another session by rollout recency" {
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
   _seed_role_record team alice stale-by-name-uuid "$TEST_PROJECT" codex
   local fake="$TEST_SKILL_DIR/fake-codex-bridge"
@@ -2533,15 +2585,8 @@ printf '%s\n' "$*" >> "$AGMSG_TEST_LOG"
 EOF
   chmod +x "$fake"
 
-  # `ls -t "$dir"/*/*/*/rollout-*.jsonl` was flaky on Windows/Git Bash --
-  # intermittently returned an empty/truncated list with no filesystem
-  # changes in between, so agmsg_resolve_codex_thread got starved of any
-  # candidate and the SessionStart hook silently no-opped (#416). The fix
-  # replaced it with find + a portable per-file mtime sort. Prove it is a
-  # real mtime sort and not an accidental filename-lexical sort: one rollout
-  # has an OLDER-looking filename timestamp but its actual mtime is touched
-  # to be the newest of the two, matching this project's cwd. A find+sort-
-  # by-name "fix" would pick the wrong (stale) rollout here.
+  # Neither filename order nor real modification time may select a native
+  # session on behalf of an unbound caller in the same project.
   local rollout_dir="$TEST_SKILL_DIR/home/.codex/sessions/2026/06/17"
   mkdir -p "$rollout_dir"
   printf '%s\n' "{\"type\":\"session_meta\",\"payload\":{\"id\":\"stale-by-name-uuid\",\"cwd\":\"$TEST_PROJECT\"}}" \
@@ -2558,9 +2603,7 @@ EOF
   AGMSG_TEST_LOG="$log" \
     env -u CODEX_THREAD_ID bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null
 
-  for _ in {1..20}; do [ -f "$log" ] && break; sleep 0.1; done
-  [ -f "$log" ]
-  grep -q -- "--thread stale-by-name-uuid" "$log"
+  [ ! -f "$log" ]
 }
 
 @test "delivery set monitor (codex): warns loudly when Node is missing" {
@@ -2645,10 +2688,11 @@ EOF
   cat > "$TEST_SKILL_DIR/teams/myteam/config.json" <<JSON
 {"name":"myteam","agents":{"alice":{"registrations":[{"type":"claude-code","project":"$TEST_PROJECT"}]}}}
 JSON
+  _activate_role myteam alice hermes-preserve-test "$TEST_PROJECT"
   AGMSG_WATCH_INTERVAL=10 bash "$SCRIPTS/watch.sh" hermes-preserve-test "$TEST_PROJECT" claude-code 3>&- &
   local watch_pid=$!
-  sleep 1
-  [ -f "$TEST_SKILL_DIR/run/watch.hermes-preserve-test.pid" ]
+  DELIVERY_FIXTURE_PIDS="${DELIVERY_FIXTURE_PIDS:+$DELIVERY_FIXTURE_PIDS }$watch_pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.hermes-preserve-test.pid"
 
   run bash "$SCRIPTS/delivery.sh" set off hermes "$TEST_PROJECT"
   [ "$status" -eq 0 ]
@@ -2656,7 +2700,7 @@ JSON
   [ "$status" -eq 0 ]
 
   kill "$watch_pid" 2>/dev/null || true
-  wait 2>/dev/null || true
+  wait "$watch_pid" 2>/dev/null || true
 }
 
 # --- grok-build (turn|off via a markdown rule file .grok/rules/agmsg.md) ---
@@ -2872,6 +2916,7 @@ JSON
   dead="$(bash -c 'echo $$')"
   wait_for_pid_exit "$dead" || true
   bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  _activate_role "testteam" alice gone-session "$TEST_PROJECT" claude-code "gone-session.$dead"
   # No `timeout` on macOS, and the suite's own idiom is to run it and wait for
   # it to end on its own -- which this guard makes it do immediately.
   bash "$SCRIPTS/watch.sh" "gone-session.$dead" "$TEST_PROJECT" claude-code \
@@ -2892,6 +2937,7 @@ JSON
   dead="$(bash -c 'echo $$')"
   wait_for_pid_exit "$dead" || true
   bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  _activate_role "testteam" alice silent-session "$TEST_PROJECT" claude-code "silent-session.$dead"
   run bash -c \
     "bash '$SCRIPTS/watch.sh' 'silent-session.$dead' '$TEST_PROJECT' claude-code 2>/dev/null"
   [ "$status" -eq 0 ] || return 1
@@ -2912,6 +2958,7 @@ JSON
   dead="$(bash -c 'echo $$')"
   wait_for_pid_exit "$dead" || true
   bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  _activate_role "testteam" alice rot-session "$TEST_PROJECT" claude-code "rot-session.$dead"
   log="$TEST_SKILL_DIR/run/watch.rot-session.$dead.log"
   mkdir -p "$TEST_SKILL_DIR/run"
   # Just UNDER the cap. One diagnostic is ~60-90 bytes, so the next write
@@ -2946,6 +2993,7 @@ JSON
   # this fixture actually produces rather than guessed.
   local log db record chars bytes pad cap live
   bash "$SCRIPTS/join.sh" "境界検査のためのとても長い日本語チーム名" alice claude-code "$TEST_PROJECT" >/dev/null
+  _activate_role "境界検査のためのとても長い日本語チーム名" alice mb-session "$TEST_PROJECT" claude-code "mb-session"
   db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path 境界検査のためのとても長い日本語チーム名')"
   rm -f "$db"
   log="$TEST_SKILL_DIR/run/watch.mb-session.log"
@@ -2997,6 +3045,7 @@ JSON
   # derivation as the multibyte case: observe the record, then set the cap.
   local log db record chars bytes cap pad live shim wpid waited
   bash "$SCRIPTS/join.sh" "境界検査のためのとても長い日本語チーム名" alice claude-code "$TEST_PROJECT" >/dev/null
+  _activate_role "境界検査のためのとても長い日本語チーム名" alice nowc-session "$TEST_PROJECT" claude-code "nowc-session"
   db="$(cd "$TEST_SKILL_DIR" && bash -c '. scripts/lib/storage.sh; agmsg_db_path 境界検査のためのとても長い日本語チーム名')"
   rm -f "$db"
   log="$TEST_SKILL_DIR/run/watch.nowc-session.log"
@@ -3059,6 +3108,7 @@ JSON
   dead="$(bash -c 'echo $$')"
   wait_for_pid_exit "$dead" || true
   bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  _activate_role "testteam" alice zerocap-session "$TEST_PROJECT" claude-code "zerocap-session.$dead"
   log="$TEST_SKILL_DIR/run/watch.zerocap-session.$dead.log"
   mkdir -p "$TEST_SKILL_DIR/run"
   printf 'a previous generation worth keeping\n' > "$log"
@@ -3090,6 +3140,7 @@ JSON
   dead="$(bash -c 'echo $$')"
   wait_for_pid_exit "$dead" || true
   bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  _activate_role "testteam" alice bogus-session "$TEST_PROJECT" claude-code "bogus-session.$dead"
   log="$TEST_SKILL_DIR/run/watch.bogus-session.$dead.log"
   mkdir -p "$TEST_SKILL_DIR/run"
   # 40 bytes short of the default: any diagnostic is longer than that.
@@ -3116,6 +3167,7 @@ JSON
   dead="$(bash -c 'echo $$')"
   wait_for_pid_exit "$dead" || true
   bash "$SCRIPTS/join.sh" testteam alice claude-code "$TEST_PROJECT" >/dev/null
+  _activate_role "testteam" alice tiny-session "$TEST_PROJECT" claude-code "tiny-session.$dead"
   log="$TEST_SKILL_DIR/run/watch.tiny-session.$dead.log"
   mkdir -p "$TEST_SKILL_DIR/run"
   AGMSG_WATCH_LOG_MAX_BYTES=1 bash "$SCRIPTS/watch.sh" \
@@ -3126,6 +3178,7 @@ JSON
 }
 
 @test "check-inbox: a live watcher no longer stops the turn side (#694)" {
+  _activate_role testteam alice both-session "$TEST_PROJECT"
   # The negative control for `both`. Before this, ANY live watcher pid made
   # this hook exit 0 -- including a watcher delivering nothing, which is the
   # one situation `both` is reached for. The watcher here is alive and does
@@ -3148,6 +3201,7 @@ JSON
 }
 
 @test "check-inbox: what the watcher already took is not offered twice (#694)" {
+  _activate_role testteam alice dup-session "$TEST_PROJECT"
   # Why removing the deferral is safe, measured rather than argued. The watcher
   # consumes through storage_read_cursor_consume, which records a message_read
   # event per delivered id AND advances the cursor; storage_list_unread

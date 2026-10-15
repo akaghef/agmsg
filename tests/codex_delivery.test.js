@@ -13,6 +13,7 @@ function fixture(t, active=true) {
     pendingWake:true,stopping:false,deliveryPromise:null,deliveryFile:path.join(dir,'delivery.json'),
     identity:{team:'test',name:'parent'},identities:[{team:'test',name:'parent'}]});
   b.calls=[];b.acks=[];b.armed=0;
+  b.eligiblePairs=()=>new Set(['test\tparent']);
   b.peekInbox=()=>[{team:'test',name:'parent',rows:[{id:'msg-1',at:'2026-10-15T00:00:00Z',from:'child',body:'DONE'}]}];
   b.acknowledgeDelivery=(record)=>{b.acks.push(record);fs.unlinkSync(b.deliveryFile);};
   b.armWatch=async()=>{b.armed++;};

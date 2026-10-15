@@ -19,7 +19,7 @@ case "$ACTION" in
     source "$scripts/lib/storage.sh" 2>/dev/null || source "$(dirname "$0")/../lib/storage.sh"
     agmsg_storage_load
     rows="$(storage_list_unread "$team" "$agent" 2>/dev/null || true)"
-    python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin if x.strip()]; print(f"unread count: {len(rows)}"); [print("unread: "+str(x.get("title",x.get("id","(untitled)")))+" — from "+str(x.get("from","unknown"))) for x in rows]' <<<"$rows"
+    python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin if x.strip()]; print(f"unread count: {len(rows)}"); [print("unread: "+str(x.get("title") or x.get("body", "").replace("\n", " ")[:80] or "(untitled)")+" — from "+str(x.get("from","unknown"))) for x in rows]' <<<"$rows"
     ;;
   send)
     addr="${1:?address required}"; from="${2:?from required}"; body="${3:?body required}"; kind="${4:-message}"

@@ -1,5 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Session-scoped leave: leave.sh <project> <type> <name> [native_session_id].
+# The existing two-argument roster-removal command remains compatible.
+if [ "$#" -ge 3 ]; then
+PROJECT="${1:?Usage: leave.sh <project> <type> <name> [native_session_id]}"
+TYPE="${2:?Missing type}"; NAME="${3:?Missing name}"
+SESSION="${4:-${CLAUDE_CODE_SESSION_ID:-}}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/lib/role-session.sh"
+source "$SCRIPT_DIR/lib/resolve-project.sh"
+[ "$TYPE" != codex ] || SESSION="${CODEX_THREAD_ID:-}"
+[ -n "$SESSION" ] || { echo status=unbound; exit 1; }
+OWNER="$(agmsg_normalize_instance_id "$SESSION" "$TYPE")"
+[ "$TYPE" != codex ] || OWNER="$SESSION"
+PROJECT="$(agmsg_resolve_project "$PROJECT" "$TYPE")"
+while IFS=$'\t' read -r team agent; do
+  [ "$agent" = "$NAME" ] || continue
+  agmsg_role_active_release "$team" "$agent" "$TYPE" "$(agmsg_instance_bare_sid "$SESSION")" "$OWNER"
+done < <("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE")
+echo status=ok
+exit 0
+fi
 
 # Usage: leave.sh <team> <agent_id>
 #

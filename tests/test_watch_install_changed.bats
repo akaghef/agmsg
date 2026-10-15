@@ -20,14 +20,28 @@ load test_helper
 
 setup() {
   setup_test_env
-  case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) export AGMSG_AGENT_PID="" ;; esac
-  export PROJ="/tmp/agmsg-watch-install-proj"
+  export AGMSG_AGENT_PID=""
+  export PROJ="$TEST_SKILL_DIR/project"
+  mkdir -p "$PROJ"
+  PROJ="$(cd "$PROJ" && pwd -P)"
+  WATCH_FIRST_PID="" WATCH_SECOND_PID=""
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
   bash "$SCRIPTS/join.sh" team bob claude-code "$PROJ" >/dev/null
 }
 
 teardown() {
+  local pid
+  for pid in "$WATCH_FIRST_PID" "$WATCH_SECOND_PID"; do
+    [ -n "$pid" ] || continue
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
   teardown_test_env
+}
+
+_claim_watch() {
+  setup_live_owner "$TEST_SKILL_DIR/run" "$1"
+  bash "$SCRIPTS/actas-claim.sh" "$PROJ" claude-code alice "$1" >/dev/null
 }
 
 # Wait until <condition> holds, up to ~15s. Returns non-zero if it never did, so
@@ -46,8 +60,10 @@ _wait_for() {
 @test "watch: exits and says so when its own installation is replaced (#684)" {
   local out="$BATS_TEST_TMPDIR/out.txt"
   : > "$out"
+  _claim_watch sid-684
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" sid-684 "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
   local pid=$!
+  WATCH_FIRST_PID="$pid"
 
   # Positive control FIRST. Without it, a watcher that never started would pass
   # every assertion below by being equally absent -- and "it exited" would be
@@ -76,6 +92,7 @@ _wait_for() {
   kill -0 "$pid" 2>/dev/null && was_alive=1
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
+  WATCH_FIRST_PID=""
 
   [ "$was_alive" -eq 0 ]
   # On STDOUT, not stderr. Every launcher we ship sends this watcher's stderr to
@@ -91,8 +108,10 @@ _wait_for() {
   # guard that fired on its own pidfile would still pass the test above.
   local out="$BATS_TEST_TMPDIR/out2.txt"
   : > "$out"
+  _claim_watch sid-684b
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" sid-684b "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
   local pid=$!
+  WATCH_FIRST_PID="$pid"
 
   bash "$SCRIPTS/send.sh" team bob alice "first" >/dev/null
   _wait_for "grep -q 'first' '$out'" || true
@@ -106,6 +125,7 @@ _wait_for() {
   kill -0 "$pid" 2>/dev/null && was_alive=1
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
+  WATCH_FIRST_PID=""
 
   [ "$was_alive" -eq 1 ]
   run grep -c 'installation was updated' "$out"
@@ -123,16 +143,20 @@ _wait_for() {
   local out1="$BATS_TEST_TMPDIR/first.txt" out2="$BATS_TEST_TMPDIR/second.txt"
   : > "$out1"; : > "$out2"
 
+  _claim_watch shared-sid
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" shared-sid "$PROJ" claude-code >"$out1" 2>/dev/null 3>&- 4>&- &
   local first=$!
+  WATCH_FIRST_PID="$first"
   _wait_for "[ -s '$TEST_SKILL_DIR/run/watch.shared-sid.pid' ]" || true
 
   # Same session id: this one takes the slot and stops the first (#66).
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" shared-sid "$PROJ" claude-code >"$out2" 2>/dev/null 3>&- 4>&- &
   local second=$!
+  WATCH_SECOND_PID="$second"
   _wait_for "! kill -0 $first 2>/dev/null" || true
   kill "$first" 2>/dev/null || true
   wait "$first" 2>/dev/null || true
+  WATCH_FIRST_PID=""
 
   # The successor must still be armed.
   bash "$SCRIPTS/send.sh" team bob alice "successor-control" >/dev/null
@@ -145,6 +169,7 @@ _wait_for() {
   kill -0 "$second" 2>/dev/null && was_alive=1
   kill "$second" 2>/dev/null || true
   wait "$second" 2>/dev/null || true
+  WATCH_SECOND_PID=""
 
   [ "$was_alive" -eq 0 ]
   grep -q 'installation was updated' "$out2"

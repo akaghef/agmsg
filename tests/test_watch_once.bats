@@ -7,6 +7,8 @@ setup() {
   export PROJ="/tmp/agmsg-watch-once-proj"
   bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
   bash "$SCRIPTS/join.sh" team bob codex "$PROJ" >/dev/null
+  export CODEX_THREAD_ID="watch-once-thread"
+  bash "$SCRIPTS/actas-claim.sh" "$PROJ" codex alice "$CODEX_THREAD_ID" >/dev/null
 }
 
 teardown() {
@@ -136,8 +138,9 @@ _assert_startup_was_delayed() {
 }
 
 @test "watch-once: skips a subscription held by another live session" {
+  release_alice
   setup_live_owner "$TEST_SKILL_DIR/run" other-sid
-  bash "$SCRIPTS/actas-claim.sh" "$PROJ" codex alice other-sid >/dev/null
+  CODEX_THREAD_ID=other-sid bash "$SCRIPTS/actas-claim.sh" "$PROJ" codex alice other-sid >/dev/null
   bash "$SCRIPTS/send.sh" team bob alice "locked out" >/dev/null
 
   run bash "$TYPES/codex/watch-once.sh" "$PROJ" codex --name alice --team team --timeout 1 --interval 1
@@ -162,12 +165,21 @@ _assert_startup_was_delayed() {
 }
 
 @test "watch-once: #605 facts stay quiet when another pair still resolves" {
+  release_alice
   setup_live_owner "$TEST_SKILL_DIR/run" other-sid
-  bash "$SCRIPTS/actas-claim.sh" "$PROJ" codex alice other-sid >/dev/null
+  CODEX_THREAD_ID=other-sid bash "$SCRIPTS/actas-claim.sh" "$PROJ" codex alice other-sid >/dev/null
+  bash "$SCRIPTS/actas-claim.sh" "$PROJ" codex bob "$CODEX_THREAD_ID" >/dev/null
   bash "$SCRIPTS/send.sh" team alice bob "for bob, not alice" >/dev/null
 
   run bash "$TYPES/codex/watch-once.sh" "$PROJ" codex --team team --timeout 1 --interval 1
   [ "$status" -eq 0 ]
   [[ "$output" =~ "status=pending" ]]
   [[ "$output" != *"lock="* ]]
+}
+
+release_alice() {
+  SKILL_DIR="$TEST_SKILL_DIR" bash -c '
+    source "$1/lib/role-session.sh"
+    agmsg_role_active_release team alice codex "$CODEX_THREAD_ID" "$CODEX_THREAD_ID"
+  ' _ "$SCRIPTS"
 }

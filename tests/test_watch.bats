@@ -22,10 +22,26 @@ teardown() {
   teardown_test_env
 }
 
+# Explicit session membership is part of every delivery fixture. The watcher
+# itself never claims a role from the project's registration list.
+_claim_watch() {
+  local sid="$1" name="${2:-alice}"
+  bash "$SCRIPTS/actas-claim.sh" "$PROJ" claude-code "$name" "$sid" >/dev/null
+}
+
+_release_watch() {
+  local sid="$1" name="${2:-alice}"
+  ( export SKILL_DIR="$TEST_SKILL_DIR"
+    source "$SCRIPTS/lib/role-session.sh"
+    local owner="$(_iid "$sid")"
+    agmsg_role_active_release team "$name" claude-code "$(agmsg_instance_bare_sid "$owner")" "$owner" )
+}
+
 # Run watch.sh in the background for <secs> seconds, capturing stdout to <out>.
 # Returns once the watcher has been stopped.
 run_watcher_for() {
   local sid="$1" out="$2" secs="$3"
+  _claim_watch "$sid"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
   local pid=$!
   sleep "$secs"
@@ -62,6 +78,7 @@ _stop_watcher() {
 # Stop once <file> exists.
 run_watcher_until_file() {
   local sid="$1" out="$2" file="$3" pid rc=0
+  _claim_watch "$sid"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- &
   pid=$!
   wait_for_file "$file" || rc=1
@@ -72,6 +89,7 @@ run_watcher_until_file() {
 # Stop once <out> contains <needle>.
 run_watcher_until_contains() {
   local sid="$1" out="$2" needle="$3" pid rc=0
+  _claim_watch "$sid"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- &
   pid=$!
   wait_for_file_contains "$out" "$needle" || rc=1
@@ -82,6 +100,7 @@ run_watcher_until_contains() {
 run_watcher_until() {
   local sid="$1" out="$2" needle="$3" before
   before=$(_read_cursor team alice 2>/dev/null || echo 0)
+  _claim_watch "$sid"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
   local pid=$!
   _wait_for_file_contains "$out" "$needle"
@@ -164,6 +183,7 @@ _wait_for_file_contains() {
   local sid="sess-restart"
 
   # First watcher consumes M1 into the shared store frontier.
+  _claim_watch "$sid"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code \
     >"$TEST_SKILL_DIR/out1.log" 2>/dev/null 3>&- 4>&- &
   local w1=$!
@@ -200,6 +220,7 @@ _wait_for_file_contains() {
   grep -q "M0-history" "$TEST_SKILL_DIR/fresh1.log"
 
   bash "$SCRIPTS/send.sh" team bob alice "M-live" >/dev/null
+  _release_watch "sess-fresh"
   run_watcher_until "sess-fresh2" "$TEST_SKILL_DIR/fresh2.log" "M-live"
   grep -q "M-live" "$TEST_SKILL_DIR/fresh2.log"
   ! grep -q "M0-history" "$TEST_SKILL_DIR/fresh2.log"
@@ -227,6 +248,7 @@ _wait_for_file_contains() {
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
   local out="$TEST_SKILL_DIR/liveness-delivery.log"
 
+  _claim_watch "$iid"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
   local w=$!
   # There is no seed race: a pre-poll message remains unread at cursor zero.
@@ -247,7 +269,8 @@ _wait_for_file_contains() {
   run kill -0 "$w"; [ "$status" -ne 0 ]
   [ "$(_read_cursor team alice)" = "$first_cursor" ]
   refute grep -q "M2-undelivered" "$out"
-  run_watcher_for "after-liveness" "$TEST_SKILL_DIR/liveness-redelivery.log" 2
+  _release_watch "$iid"
+  run_watcher_until_contains "after-liveness" "$TEST_SKILL_DIR/liveness-redelivery.log" "M2-undelivered"
   grep -q "M2-undelivered" "$TEST_SKILL_DIR/liveness-redelivery.log"
 }
 
@@ -257,6 +280,7 @@ _wait_for_file_contains() {
   local iid="$(_iid "$sid")"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
 
+  _claim_watch "$sid"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code \
     1>&- 2>/dev/null 3>&- 4>&- &
   local w=$!
@@ -292,6 +316,7 @@ _wait_for_file_contains() {
 @test "watch: actas-mode watcher creates a ready sentinel and removes it on exit" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
   local ready="$TEST_SKILL_DIR/run/ready.team__alice"
+  _claim_watch "sess-ready"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-ready" "$PROJ" claude-code alice \
     >/dev/null 2>&1 3>&- 4>&- &
   local w=$!
@@ -327,6 +352,7 @@ _wait_for_file_contains() {
   # so the marker is streamed whether it lands before or after the first cursor
   # read. The wait below is still the evidence; only the ordering crutch is gone.
   local out="$TEST_SKILL_DIR/broad.log"
+  _claim_watch "sess-broad"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-broad" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- &
   local w=$!
   bash "$SCRIPTS/send.sh" team bob alice "M-broad-marker" >/dev/null
@@ -353,6 +379,7 @@ _wait_for_file_contains() {
 @test "watch: ready sentinel records the owner session_id" {
   skip_on_windows "watcher background launch under Git Bash (#182)"
   local ready="$TEST_SKILL_DIR/run/ready.team__alice"
+  _claim_watch "sess-own"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-own" "$PROJ" claude-code alice \
     >/dev/null 2>&1 3>&- 4>&- &
   local w=$! i
@@ -365,6 +392,7 @@ _wait_for_file_contains() {
 
 @test "watch: cleanup leaves a sentinel that a successor session re-owned" {
   local ready="$TEST_SKILL_DIR/run/ready.team__alice"
+  _claim_watch "sess-old"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-old" "$PROJ" claude-code alice \
     >/dev/null 2>&1 3>&- 4>&- &
   local w=$! i
@@ -384,6 +412,7 @@ _wait_for_file_contains() {
   mkdir -p "$TEST_SKILL_DIR/run"
 
   # Start a watcher so a pidfile exists with a live pid.
+  _claim_watch "sess1"
   AGMSG_WATCH_INTERVAL=60 bash "$SCRIPTS/watch.sh" "sess1" "$PROJ" claude-code \
     >/dev/null 2>&1 3>&- 4>&- &
   local wpid=$!
@@ -415,6 +444,7 @@ _wait_for_file_contains() {
 
 @test "session-start: GCs a stale ready sentinel but keeps a live one" {
   skip_on_windows "watcher live-owner liveness under Git Bash (#182)"
+  _claim_watch "somesess"
   bash "$SCRIPTS/join.sh" team alice claude-code "$PROJ" >/dev/null
   mkdir -p "$TEST_SKILL_DIR/run"
   # Stale (owner has no live cc-instance).
@@ -454,8 +484,10 @@ _wait_pidfile() {
   local pf1="$TEST_SKILL_DIR/run/watch.shared.$sp1.pid"
   local pf2="$TEST_SKILL_DIR/run/watch.shared.$sp2.pid"
 
+  _claim_watch "shared.$sp1"
   AGMSG_WATCH_INTERVAL=5 bash "$SCRIPTS/watch.sh" "shared.$sp1" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w1=$!
+  _claim_watch "shared.$sp2" bob
   AGMSG_WATCH_INTERVAL=5 bash "$SCRIPTS/watch.sh" "shared.$sp2" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w2=$!
 
@@ -485,10 +517,12 @@ _wait_pidfile() {
   local iid="solo.$sesspid"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
 
+  _claim_watch "$iid"
   AGMSG_WATCH_INTERVAL=5 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w1=$!
   _wait_pidfile "$pf" "$w1"
 
+  _claim_watch "$iid"
   AGMSG_WATCH_INTERVAL=5 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w2=$!
   # Successor claims the pidfile slot...
@@ -511,6 +545,7 @@ _wait_pidfile() {
 # Run watch.sh for <secs> with an active name (actas mode), then stop it.
 run_named_watcher_for() {
   local sid="$1" out="$2" secs="$3" name="$4" pid
+  _claim_watch "$sid" "$name"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code "$name" >"$out" 2>/dev/null 3>&- &
   pid=$!
   sleep "$secs"
@@ -563,10 +598,12 @@ _record_handover_events() {
   local iid="solo.$sesspid"
   local pf="$TEST_SKILL_DIR/run/watch.$iid.pid"
 
+  _claim_watch "$iid"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w1=$!
   _wait_pidfile "$pf" "$w1"
 
+  _claim_watch "$iid"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$iid" "$PROJ" claude-code >/dev/null 2>&1 3>&- 4>&- &
   local w2=$!
 
@@ -639,71 +676,22 @@ _record_handover_events() {
   refute grep -n 'kill "\$prev_pid"' "$watch_sh"
 }
 
-@test "watch: a second unfiltered watcher says it is sharing, and a lone one does not (#683)" {
-  # Two watchers with no active name subscribe to the same unclaimed pairs. The
-  # read cursor is one per (team, agent), so whoever polls first takes the row
-  # and the other never sees it — and `inbox.sh` then truthfully says "no new
-  # messages", because it was read. Nothing observable is left behind, so this
-  # is said at the only moment it can be: startup.
-  #
-  # Asserted from the LOG. In the configuration this runs in, fd2 is /dev/null
-  # (#691) — the helpers above redirect it too — so a warning written only to
-  # stderr would be invisible here and in production.
-  #
-  # Composite ids: a bare token is normalized on the way in (watch.sh:92), so
-  # naming the pidfile from a bare id waits for a file never written. Measured.
-  local run_dir="$TEST_SKILL_DIR/run"
-  local solo_id="solo-sid.$$" first_id="first-sid.$$" second_id="second-sid.$$" third_id="third-sid.$$"
-
-  # NEGATIVE FIRST, on the ordinary case: one watcher, alone. An implementation
-  # that always warns passes the positive half below and is wrong every start.
-  # Given seconds rather than a file to wait for, because the assertion is an
-  # ABSENCE — there is no arrival to synchronise on, and waiting longer only
-  # makes the negative stronger.
-  run_watcher_for "$solo_id" "$BATS_TEST_TMPDIR/solo.out" 2
-  refute grep -qF -- "another watcher" "$run_dir/watch.$solo_id.log"
-
-  # Now a live one, and a second started while it runs.
+@test "watch: unbound sibling cannot share a bound session's inbox (#683)" {
+  local first_id="first-sid.$$" second_id="second-sid.$$"
+  local first_out="$BATS_TEST_TMPDIR/first.out" second_out="$BATS_TEST_TMPDIR/second.out"
+  _claim_watch "$first_id"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$first_id" "$PROJ" claude-code \
-    >"$BATS_TEST_TMPDIR/first.out" 2>/dev/null 3>&- &
+    >"$first_out" 2>/dev/null 3>&- &
   local first_pid=$!
-  wait_for_file "$run_dir/watch.$first_id.pid"
+  wait_for_file "$TEST_SKILL_DIR/run/watch.$first_id.pid"
 
-  # Waits for the LAST of the three lines, not for the pidfile: the pidfile is
-  # written before the warning, so a test that waits on it kills the watcher
-  # mid-sentence and sees a partial message. Measured — that is how this failed.
-  local second_log="$run_dir/watch.$second_id.log"
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$second_id" "$PROJ" claude-code \
-    >"$BATS_TEST_TMPDIR/second.out" 2>/dev/null 3>&- &
-  local second_pid=$!
-  wait_for_file_contains "$second_log" "/agmsg actas"
-  _stop_watcher "$second_pid"
-
-  grep -q -F -- "another watcher" "$second_log"
-  # The remedy, not only the cause. A warning that names neither what is lost
-  # nor what to type leaves the reader stopped.
-  grep -q -F -- "polls first" "$second_log"
-  grep -q -F -- "/agmsg actas" "$second_log"
-
-  # And a filtered watcher stays quiet even with the same unfiltered one alive:
-  # it is not sharing anything.
-  run_named_watcher_for "$third_id" "$BATS_TEST_TMPDIR/third.out" 2 alice
-  refute grep -qF -- "another watcher" "$run_dir/watch.$third_id.log"
-
-  # A DIFFERENT PROJECT does not warn, even with this project's unfiltered
-  # watcher still live. `RUN_DIR` is per install, so the scan sees that pidfile
-  # — but the subscription is per project and they share no pairs. Without the
-  # project in the metadata this case warns, which is a false alarm on every
-  # installation serving two projects (raised in review).
-  local other_proj="/tmp/agmsg-watch-proj-other" other_id="other-proj-sid.$$"
-  bash "$SCRIPTS/join.sh" otherteam carol claude-code "$other_proj" >/dev/null
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$other_id" "$other_proj" claude-code \
-    >"$BATS_TEST_TMPDIR/other.out" 2>/dev/null 3>&- &
-  local other_pid=$!
-  sleep 2
-  _stop_watcher "$other_pid"
-  refute grep -qF -- "another watcher" "$run_dir/watch.$other_id.log"
-
+  run env AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$second_id" "$PROJ" claude-code
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no available identities"* ]] || return 1
+  bash "$SCRIPTS/send.sh" team bob alice "belongs to the active owner" >/dev/null
+  wait_for_file_contains "$first_out" "belongs to the active owner"
+  [[ "$output" != *"belongs to the active owner"* ]] || return 1
+  refute grep -qF -- "another watcher" "$TEST_SKILL_DIR/run/watch.$first_id.log"
   _stop_watcher "$first_pid"
 }
 
@@ -723,6 +711,7 @@ _record_handover_events() {
   # the cleanup rather than the ordering — measured, that is how the first
   # version of this failed.
   local run_dir="$TEST_SKILL_DIR/run" named_id="named-order.$$"
+  _claim_watch "$named_id"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$named_id" "$PROJ" claude-code alice \
     >"$BATS_TEST_TMPDIR/named.out" 2>/dev/null 3>&- &
   local named_pid=$!
@@ -757,6 +746,7 @@ _record_handover_events() {
   local run_dir="$TEST_SKILL_DIR/run" sid="owner.$$"
   local pf="$run_dir/watch.$sid.pid" ff="$run_dir/watch.$sid.filter"
 
+  _claim_watch "$sid"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code \
     >"$BATS_TEST_TMPDIR/owner.out" 2>/dev/null 3>&- &
   local w=$!
@@ -788,6 +778,7 @@ _record_handover_events() {
   [ -f "$DB" ]
   chmod 000 "$DB"
   local out="$BATS_TEST_TMPDIR/hc.out"
+  _claim_watch "sess-hc"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "sess-hc" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
   local pid=$!
   sleep 2                     # > one poll interval; a spinning watcher would re-emit
@@ -812,6 +803,7 @@ _record_handover_events() {
   local out="$TEST_SKILL_DIR/burst.log"
   local pf="$TEST_SKILL_DIR/run/watch.$(_iid "$sid").pid"
 
+  _claim_watch "$sid"
   AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "$sid" "$PROJ" claude-code >"$out" 2>/dev/null 3>&- 4>&- &
   local w=$!
   _wait_for_file "$pf"          # watcher process is live; unread has no seed race
@@ -831,38 +823,20 @@ _record_handover_events() {
   done
 }
 
-@test "watch: empty session_id gets a generated fallback instead of a Usage error (#236)" {
-  local out="$BATS_TEST_TMPDIR/empty-sid.out"
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "" "$PROJ" claude-code alice >"$out" 2>&1 3>&- 4>&- &
-  local pid=$!
-  # A fallback id means a watch.agmsg-*.pid appears under run/ as the watcher arms.
-  local i started=0
-  for i in $(seq 1 25); do
-    if ls "$TEST_SKILL_DIR/run"/watch.agmsg-*.pid >/dev/null 2>&1; then started=1; break; fi
-    sleep 0.2
-  done
-  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
-  [ "$started" -eq 1 ]
-  ! grep -q "Usage: watch.sh" "$out"
+@test "watch: empty native Claude session remains unbound (#236)" {
+  bash "$SCRIPTS/send.sh" team bob alice "unclaimed empty session mail" >/dev/null
+  run env AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" "" "$PROJ" claude-code alice
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"unclaimed empty session mail"* ]] || return 1
+  [ "$(_read_cursor team alice)" = 0 ]
+  refute test -f "$TEST_SKILL_DIR/run/ready.team__alice"
 }
 
-# Callers pass "${GROK_SESSION_ID:--}" (and the same pattern for other hosts)
-# so a launcher that drops a quoted-empty first arg cannot shift project/type.
-# watch.sh must fold "-" into the same generated-fallback path as "" (#236).
-@test "watch: sentinel '-' session_id resolves like an empty one (#477)" {
-  local out="$BATS_TEST_TMPDIR/dash-sid.out"
-  AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" - "$PROJ" claude-code alice >"$out" 2>&1 3>&- &
-  local pid=$!
-  # Folded to empty => a generated fallback id, so a watch.agmsg-*.pid appears.
-  local i started=0
-  for i in $(seq 1 25); do
-    if ls "$TEST_SKILL_DIR/run"/watch.agmsg-*.pid >/dev/null 2>&1; then started=1; break; fi
-    sleep 0.2
-  done
-  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
-  [ "$started" -eq 1 ]
-  # No literal "-" session id leaked into the run dir key space.
-  refute ls "$TEST_SKILL_DIR/run"/watch.-*.pid >/dev/null 2>&1
-  refute grep -q "Usage: watch.sh" "$out"
-  refute grep -q "ERROR: unknown agent type" "$out"
+@test "watch: sentinel '-' native Claude session remains unbound (#477)" {
+  bash "$SCRIPTS/send.sh" team bob alice "unclaimed dash session mail" >/dev/null
+  run env AGMSG_WATCH_INTERVAL=1 bash "$SCRIPTS/watch.sh" - "$PROJ" claude-code alice
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"unclaimed dash session mail"* ]] || return 1
+  [ "$(_read_cursor team alice)" = 0 ]
+  refute test -f "$TEST_SKILL_DIR/run/ready.team__alice"
 }

@@ -6,6 +6,11 @@ setup() {
   setup_test_env
   bash "$SCRIPTS/join.sh" testteam alice claude-code /tmp/project-a
   bash "$SCRIPTS/join.sh" testteam bob claude-code /tmp/project-a
+  export AGMSG_RESOLVE_PROJECT=0
+  export CLAUDE_CODE_SESSION_ID="inbox-test-session"
+  bash "$SCRIPTS/actas-claim.sh" /tmp/project-a claude-code alice "$CLAUDE_CODE_SESSION_ID" >/dev/null
+  HOOK_INPUT="$TEST_SKILL_DIR/hook-input.json"
+  printf '{"session_id":"%s"}' "$CLAUDE_CODE_SESSION_ID" > "$HOOK_INPUT"
   BARRIER="$TEST_SKILL_DIR/mark-barrier"
 }
 
@@ -120,7 +125,7 @@ _break_only_this_teams_store() {
 # Prints that text, or nothing at all.
 delivered_to_operator() {
   local out status
-  out="$(bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a </dev/null 2>/dev/null)" && status=0 || status=$?
+  out="$(bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a <"$HOOK_INPUT" 2>/dev/null)" && status=0 || status=$?
   [ "$status" -eq 0 ] || return 0                 # the runtime's rule
   [ -n "$out" ] || return 0
   # Valid JSON, decision=block, and then the reason — each a separate gate so a
@@ -149,6 +154,7 @@ delivered_to_operator() {
   bash "$SCRIPTS/join.sh" mmteam alice claude-code /tmp/project-a >/dev/null
   bash "$SCRIPTS/join.sh" zzteam alice claude-code /tmp/project-a >/dev/null
   bash "$SCRIPTS/join.sh" zzteam bob claude-code /tmp/project-a >/dev/null
+  bash "$SCRIPTS/actas-claim.sh" /tmp/project-a claude-code alice "$CLAUDE_CODE_SESSION_ID" >/dev/null
   bash "$SCRIPTS/send.sh" aateam bob alice "before the break" >/dev/null
   bash "$SCRIPTS/send.sh" zzteam bob alice "after the break" >/dev/null
   _break_only_this_teams_store mmteam
@@ -180,9 +186,10 @@ delivered_to_operator() {
   # the status is free to carry the failure — and it must, because claiming
   # "no new messages" states something this run never established.
   bash "$SCRIPTS/join.sh" zzlastteam alice claude-code /tmp/project-a >/dev/null
+  bash "$SCRIPTS/actas-claim.sh" /tmp/project-a claude-code alice "$CLAUDE_CODE_SESSION_ID" >/dev/null
   _break_only_this_teams_store zzlastteam
 
-  run bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a </dev/null
+  run bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a <"$HOOK_INPUT"
   [ "$status" -ne 0 ]
   [[ "$output" != *"no new messages"* ]]
 }
@@ -221,7 +228,7 @@ delivered_to_operator() {
 @test "check-inbox: a message arriving between display and mark is NOT marked read unseen" {
   bash "$SCRIPTS/send.sh" testteam bob alice "early"
   AGMSG_TEST_MARK_BARRIER="$BARRIER" bash "$SCRIPTS/check-inbox.sh" claude-code /tmp/project-a \
-    </dev/null > "$TEST_SKILL_DIR/check-run.out" 2>/dev/null 3>&- &
+    <"$HOOK_INPUT" > "$TEST_SKILL_DIR/check-run.out" 2>/dev/null 3>&- &
   bg_pid=$!
   await_barrier_reached
   bash "$SCRIPTS/send.sh" testteam bob alice "late"

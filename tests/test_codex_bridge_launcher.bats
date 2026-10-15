@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 
-# Unit tests for codex-bridge-launcher.sh thread resolution (#350).
-# The launcher must bind the bridge to the role's RECORDED codex thread instead
+# Unit tests for codex-bridge-launcher.sh active membership resolution.
+# The launcher must bind the bridge to the role's ACTIVE codex thread instead
 # of the app-server's ambiguous "loaded" thread (which a co-resident codex thread
 # in the same cwd could otherwise capture). A mock bridge records the --thread
 # the launcher passes.
@@ -102,11 +102,19 @@ teardown() {
   teardown_test_env
 }
 
-# Write a role-session record (team, agent) -> thread for a project.
-put_record() {
-  SKILL_DIR="$TEST_SKILL_DIR" bash -c \
-    'source "$1/lib/role-session.sh"; agmsg_role_session_record "$2" "$3" "$4" "$5" "$6"' \
-    _ "$SCRIPTS" "$@"
+# Explicitly leave any prior owner, then claim this native thread. Resume
+# records are still populated, but they are not delivery authorization.
+put_active() {
+  SKILL_DIR="$TEST_SKILL_DIR" bash -c '
+    source "$1/lib/role-session.sh"
+    agmsg_role_active_load "$2" "$3"
+    if [ -n "$AGMSG_ROLE_ACTIVE_SESSION" ]; then
+      agmsg_role_active_release "$2" "$3" "$AGMSG_ROLE_ACTIVE_TYPE" "$AGMSG_ROLE_ACTIVE_SESSION" "$AGMSG_ROLE_ACTIVE_OWNER"
+    fi
+    project=$(cd "$5" 2>/dev/null && pwd -P || printf "%s" "$5")
+    agmsg_role_active_claim "$2" "$3" "$4" "$project" "$6" "$4"
+    agmsg_role_session_record "$2" "$3" "$4" "$5" "$6"
+  ' _ "$SCRIPTS" "$@"
 }
 
 write_request() {
@@ -133,8 +141,8 @@ run_launcher() {
   done
 }
 
-@test "launcher: binds the recorded thread when the record's project matches (#350)" {
-  put_record team alice rec-thread-1 "$PROJ" codex
+@test "launcher: binds the active thread when the membership project matches (#350)" {
+  put_active team alice rec-thread-1 "$PROJ" codex
   run_launcher
   [ -f "$CAPTURE" ]
   grep -q -- "--thread rec-thread-1" "$CAPTURE"
@@ -143,32 +151,41 @@ run_launcher() {
 
 @test "launcher: passes the active storage override as a workspace root" {
   export AGMSG_STORAGE_PATH="$TEST_SKILL_DIR/custom-store"
-  put_record team alice rec-thread-1 "$PROJ" codex
+  put_active team alice rec-thread-1 "$PROJ" codex
   run_launcher
 
   grep -q -- "--workspace-root $AGMSG_STORAGE_PATH" "$CAPTURE"
   ! grep -q -- "--workspace-root $TEST_SKILL_DIR/db" "$CAPTURE"
 }
 
-@test "launcher: leaves a role without a recorded live thread unsubscribed (#150)" {
+@test "launcher: leaves a role without active membership unsubscribed (#150)" {
   run_launcher
   [ ! -f "$CAPTURE" ]
 }
 
-@test "launcher: leaves a role with a foreign-project record unsubscribed (#150)" {
-  put_record team alice other-thread "/some/other/project" codex
+@test "launcher: a historical resume record alone stays unsubscribed" {
+  SKILL_DIR="$TEST_SKILL_DIR" bash -c '
+    source "$1/lib/role-session.sh"
+    agmsg_role_session_record team alice historical-thread "$2" codex
+  ' _ "$SCRIPTS" "$PROJ"
+  run_launcher
+  [ ! -f "$CAPTURE" ]
+}
+
+@test "launcher: leaves a role with foreign-project active membership unsubscribed (#150)" {
+  put_active team alice other-thread "/some/other/project" codex
   run_launcher
   [ ! -f "$CAPTURE" ]
 }
 
 @test "launcher: writes the bound-thread file so a later launcher can rebind (#350)" {
-  put_record team alice rec-thread-1 "$PROJ" codex
+  put_active team alice rec-thread-1 "$PROJ" codex
   run_launcher
   [ "$(cat "$RUN_DIR/codex-bridge.team.alice.thread" 2>/dev/null)" = "rec-thread-1" ]
 }
 
 @test "launcher: replaces a stale role pidfile with the spawned bridge pid" {
-  put_record team alice rec-thread-1 "$PROJ" codex
+  put_active team alice rec-thread-1 "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=3
   printf '%s\n' 99999999 > "$RUN_DIR/codex-bridge.team.alice.pid"
   run_launcher 3>&- & local driver_pid=$!
@@ -186,10 +203,10 @@ run_launcher() {
   wait "$driver_pid" 2>/dev/null || true
 }
 
-@test "launcher: starts one bridge per recorded role and thread (#150 phase 2)" {
+@test "launcher: starts one bridge per active role and thread (#150 phase 2)" {
   bash "$SCRIPTS/join.sh" team bob codex "$PROJ" >/dev/null
-  put_record team alice thread-alice "$PROJ" codex
-  put_record team bob thread-bob "$PROJ" codex
+  put_active team alice thread-alice "$PROJ" codex
+  put_active team bob thread-bob "$PROJ" codex
   run_launcher
 
   local i lines=0
@@ -206,7 +223,7 @@ run_launcher() {
 }
 
 @test "launcher: only one dispatcher runs per project" {
-  put_record team alice thread-alice "$PROJ" codex
+  put_active team alice thread-alice "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=8
   sleep 10 3>&- & local parent_a=$!
   sleep 10 3>&- & local parent_b=$!
@@ -231,7 +248,7 @@ run_launcher() {
 }
 
 @test "launcher: stale dispatcher reclamation remains singleton under contention" {
-  put_record team alice thread-alice "$PROJ" codex
+  put_active team alice thread-alice "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=8
   local hash lock_db
   hash=$(printf '%s' "$PROJ" | bash -c 'source "$1"; agmsg_sha1' _ "$SCRIPTS/lib/hash.sh")
@@ -263,10 +280,10 @@ run_launcher() {
   wait "$parent_b" 2>/dev/null || true
 }
 
-@test "launcher: project request thread never overrides per-role recorded threads (#150 phase 2)" {
+@test "launcher: project request thread never overrides per-role active threads (#150 phase 2)" {
   bash "$SCRIPTS/join.sh" team bob codex "$PROJ" >/dev/null
-  put_record team alice thread-alice "$PROJ" codex
-  put_record team bob thread-bob "$PROJ" codex
+  put_active team alice thread-alice "$PROJ" codex
+  put_active team bob thread-bob "$PROJ" codex
   write_request thread-bob
   run_launcher
 
@@ -275,8 +292,8 @@ run_launcher() {
   ! grep -q -- $'--pair team\talice --thread thread-bob' "$CAPTURE"
 }
 
-@test "launcher: role record update keeps child scoped to the same pair" {
-  put_record team alice thread-before "$PROJ" codex
+@test "launcher: active owner change keeps child scoped to the same pair" {
+  put_active team alice thread-before "$PROJ" codex
   sleep 6 3>&- & local p=$!
   bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$p" $'team\talice' >/dev/null 2>&1 3>&- &
   local launcher_pid=$!
@@ -286,7 +303,7 @@ run_launcher() {
     sleep 0.1
   done
   grep -q -- $'--pair team\talice --thread thread-before' "$CAPTURE"
-  put_record team alice thread-after "$PROJ" codex
+  put_active team alice thread-after "$PROJ" codex
   wait "$launcher_pid" 2>/dev/null || true
   wait "$p" 2>/dev/null || true
 
@@ -327,7 +344,7 @@ wait_for_child_count() {
 }
 
 @test "launcher: a replacement dispatcher does not double the role children (#485)" {
-  put_record team alice thread-alice "$PROJ" codex
+  put_active team alice thread-alice "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=12
   sleep 14 3>&- & local parent_a=$!
   sleep 14 3>&- & local parent_b=$!
@@ -363,7 +380,7 @@ wait_for_child_count() {
 }
 
 @test "launcher: a re-registered role gets a fresh child after deregistration (#485)" {
-  put_record team alice thread-alice "$PROJ" codex
+  put_active team alice thread-alice "$PROJ" codex
   # A custom bridge command is waited synchronously by its role launcher. Keep
   # the mock lifetime below wait_for_child_count's 10-second ceiling so this
   # test measures deregistration, not the intentionally blocking test adapter.
@@ -382,7 +399,7 @@ wait_for_child_count() {
   # lists it, the re-spawn is suppressed, and the role silently never gets a
   # bridge again for the rest of the app-server's life.
   bash "$SCRIPTS/join.sh" team alice codex "$PROJ" >/dev/null
-  put_record team alice thread-alice "$PROJ" codex
+  put_active team alice thread-alice "$PROJ" codex
   [ "$(wait_for_child_count 1)" -eq 1 ]
 
   kill "$dispatcher" 2>/dev/null || true
@@ -396,7 +413,7 @@ wait_for_child_count() {
   # guarded on the team configs' mtimes. This is the test that fails if that
   # guard never invalidates: a role joined while the dispatcher is already
   # looping has to be picked up anyway.
-  put_record team alice thread-alice "$PROJ" codex
+  put_active team alice thread-alice "$PROJ" codex
   export MOCK_BRIDGE_SLEEP=20
   sleep 25 3>&- & local parent=$!
   bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$parent" >/dev/null 2>&1 3>&- &
@@ -413,7 +430,7 @@ wait_for_child_count() {
   # loop that happened to still be resolving every tick.
   sleep 3
   bash "$SCRIPTS/join.sh" team bob codex "$PROJ" >/dev/null
-  put_record team bob thread-bob "$PROJ" codex
+  put_active team bob thread-bob "$PROJ" codex
   for i in {1..100}; do
     grep -q -- $'--pair team\tbob' "$CAPTURE" 2>/dev/null && break
     sleep 0.1
@@ -442,7 +459,7 @@ wait_for_child_count() {
   printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$stubdir/tasklist"
   chmod +x "$stubdir/tasklist"
 
-  put_record team alice thread-msys "$PROJ" codex
+  put_active team alice thread-msys "$PROJ" codex
 
   sleep 6 3>&- & local p=$!
   MSYSTEM=MINGW64 PATH="$stubdir:$PATH" \
@@ -464,7 +481,7 @@ wait_for_child_count() {
   # at :291 and :381 are asking tasklist about an MSYS pid -- false on the first
   # evaluation, which means neither loop turns over and no bridge is ever
   # started. Real tasklist, no stub.
-  put_record team alice thread-win "$PROJ" codex
+  put_active team alice thread-win "$PROJ" codex
 
   sleep 6 3>&- & local p=$!
   bash "$LAUNCHER" codex "$PROJ" "ws://127.0.0.1:1" "$p" >/dev/null 2>&1 3>&- || true

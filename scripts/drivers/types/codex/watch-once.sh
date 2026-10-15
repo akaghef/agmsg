@@ -40,6 +40,7 @@ shift 2
 ACTIVE_NAME=""
 TEAM_FILTER=""
 PAIR_FILTERS=""
+NATIVE_SESSION="${CODEX_THREAD_ID:-}"
 TIMEOUT="${AGMSG_WATCH_ONCE_TIMEOUT:-300}"
 INTERVAL="${AGMSG_WATCH_ONCE_INTERVAL:-}"
 
@@ -48,6 +49,7 @@ while [ "$#" -gt 0 ]; do
     --name) ACTIVE_NAME="${2:?--name needs an agent name}"; shift 2 ;;
     --team) TEAM_FILTER="${2:?--team needs a team name}"; shift 2 ;;
     --pair) PAIR_FILTERS="${PAIR_FILTERS:+$PAIR_FILTERS$'\n'}${2:?--pair needs team<TAB>agent}"; shift 2 ;;
+    --session) NATIVE_SESSION="${2:-}"; shift 2 ;;
     --timeout) TIMEOUT="${2:?--timeout needs seconds}"; shift 2 ;;
     --interval) INTERVAL="${2:?--interval needs seconds}"; shift 2 ;;
     -h|--help)
@@ -77,8 +79,9 @@ source "$SCRIPT_DIR/../../../lib/resolve-project.sh"
 source "$SCRIPT_DIR/../../../lib/subscription.sh"
 
 PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE")"
+ACTIVE_PROJECT="$(agmsg_canonical_path "$PROJECT_PATH")"
 
-PAIRS="$(agmsg_subscription_pairs "$PROJECT_PATH" "$AGENT_TYPE" "" "$ACTIVE_NAME")" || exit 1
+PAIRS="$(CODEX_THREAD_ID="$NATIVE_SESSION" agmsg_subscription_pairs "$PROJECT_PATH" "$AGENT_TYPE" "$NATIVE_SESSION" "$ACTIVE_NAME")" || exit 1
 if [ -n "$TEAM_FILTER" ]; then
   PAIRS=$(printf '%s\n' "$PAIRS" | awk -v t="$TEAM_FILTER" -F'\t' 'NF >= 2 && $1 == t')
 fi
@@ -118,6 +121,8 @@ while true; do
     all_ids=""
     while IFS=$'\t' read -r _team _agent; do
       [ -n "$_team" ] && [ -n "$_agent" ] || continue
+      # Binding may have been released/reassigned since this watch was armed.
+      agmsg_role_active_matches "$_team" "$_agent" "$AGENT_TYPE" "$NATIVE_SESSION" "$ACTIVE_PROJECT" "$NATIVE_SESSION" || continue
       # Asked per team, inside the loop: stores are per team, so whether one
       # exists is a question about a team and there is no subscription-wide
       # answer. It used to be asked once above the loop, when a single store

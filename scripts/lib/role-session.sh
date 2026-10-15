@@ -253,3 +253,110 @@ agmsg_role_session_lookup_by_sid() {
   done
   return 0
 }
+
+# ACTIVE membership is authorization, unlike the advisory resume record above.
+# Only explicit actas writes it. A role is deliverable while its native session
+# AND actas owner match; historical records never re-establish membership.
+_agmsg_role_active_path() {
+  _agmsg_role_session_path_into "$1" "$2"
+  printf '%s/role-active.%s' "$(_actas_lock_dir)" "${_AGMSG_ROLE_SESSION_PATH##*/role-session.}"
+}
+
+agmsg_role_active_load() {
+  local path line
+  AGMSG_ROLE_ACTIVE_SESSION=""; AGMSG_ROLE_ACTIVE_OWNER=""
+  AGMSG_ROLE_ACTIVE_PROJECT=""; AGMSG_ROLE_ACTIVE_TYPE=""
+  path="$(_agmsg_role_active_path "$1" "$2")"
+  [ -f "$path" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      session=*) AGMSG_ROLE_ACTIVE_SESSION="${line#session=}" ;;
+      owner=*) AGMSG_ROLE_ACTIVE_OWNER="${line#owner=}" ;;
+      project=*) AGMSG_ROLE_ACTIVE_PROJECT="${line#project=}" ;;
+      type=*) AGMSG_ROLE_ACTIVE_TYPE="${line#type=}" ;;
+    esac
+  done < "$path"
+  # A drop/reset or displaced actas lock invalidates membership immediately.
+  if [ -z "$AGMSG_ROLE_ACTIVE_OWNER" ] || [ "$(actas_lock_owner "$1" "$2")" != "$AGMSG_ROLE_ACTIVE_OWNER" ]; then
+    AGMSG_ROLE_ACTIVE_SESSION=""; AGMSG_ROLE_ACTIVE_OWNER=""
+    AGMSG_ROLE_ACTIVE_PROJECT=""; AGMSG_ROLE_ACTIVE_TYPE=""
+  fi
+}
+
+agmsg_role_active_matches() {
+  local team="$1" agent="$2" type="$3" session="$4" project="${5:-}" owner="${6:-}"
+  [ -n "$session" ] || return 1
+  agmsg_role_active_load "$team" "$agent"
+  [ "$AGMSG_ROLE_ACTIVE_SESSION" = "$session" ] && [ "$AGMSG_ROLE_ACTIVE_TYPE" = "$type" ] || return 1
+  [ -z "$owner" ] || [ "$AGMSG_ROLE_ACTIVE_OWNER" = "$owner" ] || return 1
+  [ -z "$project" ] || [ "$AGMSG_ROLE_ACTIVE_PROJECT" = "$project" ] || return 1
+}
+
+# Serialized with matching-owner release. A busy guard fails closed; callers may
+# retry the explicit command. Codex owners have no PID liveness oracle, so an
+# existing active thread stays held until its matching leave/session-end.
+agmsg_role_active_claim() (
+  local team="$1" agent="$2" session="$3" project="$4" type="$5" owner="$6"
+  local path guard tmp result _AGMSG_HELD_ROLE_GUARD
+  [ -n "$session" ] && [ -n "$owner" ] || return 1
+  path="$(_agmsg_role_active_path "$team" "$agent")"; guard="$path.guard"
+  mkdir -p "$(_actas_lock_dir)" || return 1
+  mkdir "$guard" 2>/dev/null || return 1
+  # Trap only in this operation's subshell; never replace the caller's traps.
+  trap 'rmdir "$guard" 2>/dev/null || true' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  _AGMSG_HELD_ROLE_GUARD="$guard"
+  agmsg_role_active_load "$team" "$agent"
+  if [ -n "$AGMSG_ROLE_ACTIVE_OWNER" ] && [ "$AGMSG_ROLE_ACTIVE_OWNER" != "$owner" ]; then
+    if [ "$AGMSG_ROLE_ACTIVE_TYPE" = codex ] || actas_lock_sid_alive "$AGMSG_ROLE_ACTIVE_OWNER"; then
+      printf 'held:%s\n' "$AGMSG_ROLE_ACTIVE_OWNER"
+      return 1
+    fi
+  fi
+  if ! result="$(actas_lock_claim "$team" "$agent" "$owner")"; then
+    [ -z "$result" ] || printf '%s\n' "$result"
+    return 1
+  fi
+  # Runtime state publishes beside its destination, as role-session already
+  # does: TMPDIR may be another volume, where mv would expose a partial copy.
+  tmp="$(mktemp "$(_actas_lock_dir)/.role-active.XXXXXX")" || { return 1; }
+  if ! printf 'session=%s\nowner=%s\nproject=%s\ntype=%s\nteam=%s\nagent=%s\n' \
+      "$session" "$owner" "$project" "$type" "$team" "$agent" > "$tmp" || ! mv -f "$tmp" "$path"; then
+    rm -f "$tmp"; actas_lock_release "$team" "$agent" "$owner"
+    return 1
+  fi
+  return 0
+)
+
+agmsg_role_active_release() (
+  local team="$1" agent="$2" type="$3" session="$4" owner="${5:-}" path guard _AGMSG_HELD_ROLE_GUARD
+  [ -n "$session" ] || return 0
+  path="$(_agmsg_role_active_path "$team" "$agent")"; guard="$path.guard"
+  [ -f "$path" ] || return 0
+  mkdir "$guard" 2>/dev/null || return 1
+  # Trap only in this operation's subshell; never replace the caller's traps.
+  trap 'rmdir "$guard" 2>/dev/null || true' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  _AGMSG_HELD_ROLE_GUARD="$guard"
+  if agmsg_role_active_matches "$team" "$agent" "$type" "$session" "" "$owner"; then
+    owner="$AGMSG_ROLE_ACTIVE_OWNER"
+    rm -f "$path"
+    actas_lock_release "$team" "$agent" "$owner"
+  fi
+  return 0
+)
+
+agmsg_role_active_release_all() {
+  local type="$1" session="$2" owner="${3:-}" path team agent
+  [ -n "$session" ] || return 0
+  for path in "$(_actas_lock_dir)"/role-active.*; do
+    [ -f "$path" ] || continue
+    team="$(_agmsg_role_session_field "$path" team)"
+    agent="$(_agmsg_role_session_field "$path" agent)"
+    agmsg_role_active_release "$team" "$agent" "$type" "$session" "$owner" || true
+  done
+}
