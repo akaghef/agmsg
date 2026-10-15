@@ -64,6 +64,14 @@ function desktopFixture(t, refresh) {
   b.adminInboxAck=(batch,ids)=>{b.adminAcks.push({batch:batch.name,ids});return {status:0};};
   return b;
 }
+test('desktop attach to an unloaded thread stays alive and idle instead of dying',async t=>{
+ const b=desktopFixture(t);b.threadId='bound-thread';
+ b.client.request=async()=>{throw Object.assign(new Error('Desktop conversation owner unavailable: no-client-found'),{preDispatch:true});};
+ await b.ensureThread();
+ assert.equal(b.threadIdle,true);assert.equal(b.turnActive,false);
+ b.client.request=async()=>{throw new Error('Desktop initialize omitted client ID');};
+ await assert.rejects(b.ensureThread(),/omitted client ID/);
+});
 test('desktop owner missing before dispatch moves mail to the admin inbox without a turn',async t=>{
  const b=desktopFixture(t,async()=>{throw Object.assign(new Error('Desktop conversation owner unavailable: no-client-found'),{preDispatch:true});});
  await b.tryStartTurn();

@@ -112,6 +112,8 @@ async function fixture(t, { active = false, reply = 'success', state = conversat
   bridge.peekInbox = () => [{ team: 'sample', name: 'director', rows: [{ id: 'message', at: '2026-10-15T00:00:00Z', from: 'builder', body: '結果 ready' }] }];
   bridge.acknowledgeDelivery = record => { bridge.acks.push(structuredClone(record)); fs.unlinkSync(bridge.deliveryFile); };
   bridge.armWatch = async () => { bridge.armed++; };
+  bridge.adminInboxSend = () => { throw new Error('unexpected admin inbox write'); };
+  bridge.adminInboxAck = () => { throw new Error('unexpected admin inbox ack'); };
   return { bridge, client, requests, discoveries };
 }
 

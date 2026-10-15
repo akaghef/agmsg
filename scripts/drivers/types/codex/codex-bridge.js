@@ -1058,7 +1058,16 @@ class CodexBridge {
           excludeTurns: true,
         });
       } catch (err) {
-        if (this.opts.desktopIpc) throw err;
+        if (this.opts.desktopIpc && !err.preDispatch) throw err;
+        if (this.opts.desktopIpc) {
+          // The app has not loaded this thread (no-client-found / no owner).
+          // Stay attached; each delivery re-checks the owner and routes
+          // undeliverable mail through the delivery chain to the admin inbox.
+          console.error(`codex-bridge: ${err.message}; delivery will route through the delivery chain`);
+          this.threadIdle = true;
+          this.turnActive = false;
+          return;
+        }
         // Codex 0.142+'s --remote sessions may not create a rollout, which
         // makes the thread/resume request itself fail outright. turn/start
         // only needs threadId, so keep the bridge alive by falling back to
