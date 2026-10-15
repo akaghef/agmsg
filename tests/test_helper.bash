@@ -3,6 +3,7 @@
 
 setup_test_env() {
   export TEST_SKILL_DIR="$(mktemp -d)"
+  export AGMSG_SEND_JOURNAL="$TEST_SKILL_DIR/send-journal.jsonl"
   mkdir -p "$TEST_SKILL_DIR"/{scripts,db,teams}
 
   # Copy all scripts to isolated skill dir. Recursive so nested helper dirs

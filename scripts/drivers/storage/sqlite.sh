@@ -256,6 +256,7 @@ storage_send() {
     storage_init "$team" >/dev/null
     printf '%s\n' "$insert" | agmsg_sqlite -bail "$db" >/dev/null 2>&1 || return 1
   fi
+  agmsg_journal_send "$id" "$team" "$from" "$to" "$body" 2>/dev/null || :
   printf '%s\n' "$id"
 }
 

@@ -216,6 +216,7 @@ storage_send() {
     '{type:"message_sent",id:$id,team:$team,from:$from,to:$to,body:$body,at:$at}')" \
     || return 1
   _jsonl_with_lock _jsonl_append "$line" || return 1
+  agmsg_journal_send "$id" "$team" "$from" "$to" "$body" 2>/dev/null || :
   printf '%s\n' "$id"
 }
 _jsonl_append() { printf '%s\n' "$1" >> "$(_jsonl_log)"; }

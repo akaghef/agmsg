@@ -330,6 +330,10 @@ agmsg_sqlesc() {
   printf '%s' "$1" | sed "s/'/''/g"
 }
 
+# Shared post-commit observation helper for both built-in message writers.
+_AGMSG_JOURNAL_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/send-journal.sh"
+if [ -f "$_AGMSG_JOURNAL_LIB" ]; then source "$_AGMSG_JOURNAL_LIB" 2>/dev/null || :; fi
+
 # ── Storage driver facade (storage axis) ─────────────────────────────────────
 # The helpers above resolve the legacy sqlite path and run raw SQL; call sites
 # keep using them until #206 migrates them onto the contract below. The facade

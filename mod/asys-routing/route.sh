@@ -2,6 +2,9 @@
 set -euo pipefail
 BASE="$(cd "$(dirname "$0")" && pwd)"
 PY="$BASE/lib/routing.py"; [[ -f "$PY" ]] || PY="$BASE/agmsg-routing/lib/routing.py"
+JOURNAL_LIB="$BASE/lib/send-journal.sh"
+[[ -f "$JOURNAL_LIB" ]] || JOURNAL_LIB="$BASE/../../scripts/lib/send-journal.sh"
+if [[ -f "$JOURNAL_LIB" ]]; then source "$JOURNAL_LIB" 2>/dev/null || :; fi
 ACTION="${1:?Usage: route.sh parse|send|receive|directory|presence|watcher ...}"; shift
 export AGMSG_BRIDGE_ROOT="${AGMSG_BRIDGE_ROOT:-$HOME/Akaghef-Bridge}"
 case "$ACTION" in
@@ -25,13 +28,13 @@ case "$ACTION" in
     team="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["team"])' <<<"$parsed")"
     to="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["agent"])' <<<"$parsed")"
     python3 "$PY" validate-kind "$realm" "$kind"
-    if [[ "$realm" == local || "$realm" == mac ]]; then exec "$(dirname "$0")/send.sh" "$team" "$from" "$to" "$body" --force; fi
+    if [[ "$realm" == local || "$realm" == mac ]]; then export AGMSG_SEND_REALM="$realm" AGMSG_SEND_KIND="$kind"; exec "$(dirname "$0")/send.sh" "$team" "$from" "$to" "$body" --force; fi
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"; id="$stamp-$from-$$"
     packet="${TMPDIR:-/tmp}/agmsg-$id.json"
     python3 - "$packet" "$id" "$realm" "$team" "$from" "$to" "$kind" "$body" <<'PY'
-import datetime,json,sys
+import datetime,json,os,sys
 f,i,r,t,fr,to,k,b=sys.argv[1:]
-json.dump({"schema":"agmsg.message.v2","id":i,"realm":r,"team":t,"from":fr,"to":to,"kind":k,"reply_to":"","thread":"","created_at_utc":datetime.datetime.now(datetime.timezone.utc).isoformat(),"body":b,"status":"queued"},open(f,"w"))
+json.dump({"schema":"agmsg.message.v2","id":i,"realm":r,"team":t,"from":fr,"to":to,"kind":k,"reply_to":"","thread":os.environ.get("AGMSG_SEND_THREAD",""),"created_at_utc":datetime.datetime.now(datetime.timezone.utc).isoformat(),"body":b,"status":"queued"},open(f,"w"))
 PY
     case "$realm" in
       mac) target="$AGMSG_BRIDGE_ROOT/inbox/mac" ;;
@@ -41,11 +44,13 @@ PY
       team)
         [[ "$kind" == notice* ]] || { rm -f "$packet"; exit 2; }
         target="$AGMSG_BRIDGE_ROOT/inbox/mini"; mkdir -p "$target"; cp "$packet" "$target/$id.json"
+        agmsg_journal_send "$id" "$team" "$from" "$to" "$body" "$realm" "$kind" 2>/dev/null || :
         "$(dirname "$0")/adapters/drive.sh" send-packet "$packet" || { rm -f "$packet"; exit 20; }
         rm -f "$packet"; echo "status=queued realm=team team=$team to=$to targets=mini,drive"; exit 0 ;;
     esac
     [[ "$realm" != personal || "$kind" == notice* ]] || { rm -f "$packet"; echo "personal realm supports notice.* only" >&2; exit 2; }
     mkdir -p "$target"; cp "$packet" "$target/$id.json"
+    agmsg_journal_send "$id" "$team" "$from" "$to" "$body" "$realm" "$kind" 2>/dev/null || :
     if [[ "$realm" == personal ]]; then mkdir -p "$AGMSG_BRIDGE_ROOT/pending/mac_to_windows"; cp "$packet" "$AGMSG_BRIDGE_ROOT/pending/mac_to_windows/$id.json"; fi
     rm -f "$packet"; echo "status=queued realm=$realm team=$team to=$to path=$target/$id.json" ;;
   *)

@@ -58,3 +58,41 @@ The experimentally verified Claude-command-to-Codex Desktop route is documented
 in [Codex Desktop IPC sending](codex-desktop-ipc-send.md), with a separate
 [verification record](verification/claude-to-codex-ipc-261009.md).
 It is not yet an agmsg delivery adapter.
+
+## Committed-send journal
+
+`storage_send` in both built-in drivers and the routing outbox writer append
+one `agmsg.send-journal.v1` JSON line after their successful write. This is
+observation data, not a replacement store or the delivery/acceptance judge.
+The database schema and normal command output are unchanged. Shell functions,
+loops, variable expansion and redirected stdout cannot hide the committed body
+from this hook.
+
+Default file: `${XDG_STATE_HOME:-$HOME/.local/state}/agmsg/send-journal.jsonl`.
+`AGMSG_SEND_JOURNAL` overrides the file for tests or a managed installation.
+Rows include the actual message ID, millisecond UTC timestamp, realm, team,
+from/to, kind, thread, body and available native session IDs plus PID/cwd.
+Direct storage writes default to local/message; route sends preserve realm/kind.
+`AGMSG_SEND_THREAD` supplies optional thread metadata. A remote journal entry
+means the local outgoing packet was written; it does not prove remote receipt.
+
+Files are private (0600). Concurrent append uses a bounded lock. Every journal
+failure, including a missing helper or Python runtime, is fail-open: the
+already-committed send remains successful. Such a failure can lose observation
+records; it must never trigger a duplicate message retry. There is no database
+readback, message-body argv, new daemon, or hook configuration in this path.
+Custom third-party storage drivers must call the same post-commit helper to
+participate; the managed built-in SQLite and JSONL drivers already do.
+
+Use the existing managed installer for this bounded update:
+
+```sh
+bash systems/agmsg/src/install.sh --send-journal-only --dry-run
+bash systems/agmsg/src/install.sh --send-journal-only --apply
+python3 -m unittest discover -s systems/agmsg/tests -p test_send_journal.py -v
+```
+
+The scoped installer backs up replaced files and records their before/after
+hashes. It updates the helper, both built-in writers and route script without
+rerunning hook merging, storage migration, or watcher installation. Tests set
+an isolated journal path so fixtures never enter the live telemetry stream.
