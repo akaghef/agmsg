@@ -56,3 +56,46 @@ test('acknowledgement cannot cross role or thread boundaries',t=>{
  assert.throws(()=>ack({threadId:'foreign',batches:[]}),/different thread/);
  assert.throws(()=>ack({threadId:b.threadId,batches:[{team:'test',name:'other',ids:['msg-1']}]}),/no longer eligible/);
 });
+function desktopFixture(t, refresh) {
+  const b=fixture(t,false);b.opts.desktopIpc='/fake/ipc.sock';b.admin=[];b.adminAcks=[];
+  b.client.refreshState=refresh||(async()=>({active:false,turnId:null}));
+  b.client.prepareDelivery=()=>({transport:'desktop-ipc',requestId:'req-1',clientUserMessageId:'cum-1'});
+  b.adminInboxSend=(body)=>{b.admin.push(JSON.parse(body));return {status:0};};
+  b.adminInboxAck=(batch,ids)=>{b.adminAcks.push({batch:batch.name,ids});return {status:0};};
+  return b;
+}
+test('desktop owner missing before dispatch moves mail to the admin inbox without a turn',async t=>{
+ const b=desktopFixture(t,async()=>{throw Object.assign(new Error('Desktop conversation owner unavailable: no-client-found'),{preDispatch:true});});
+ await b.tryStartTurn();
+ assert.equal(b.calls.length,0);assert.equal(b.admin.length,1);assert.equal(b.admin[0].stage,'direct-predispatch');
+ assert.match(b.admin[0].reason,/no-client-found/);assert.equal(b.admin[0].messages[0].body,'DONE');
+ assert.equal(b.admin[0].target.thread,'thread-parent');assert.deepEqual(b.adminAcks,[{batch:'parent',ids:['msg-1']}]);
+ assert.equal(b.pendingWake,false);assert.equal(b.armed,1);
+});
+test('desktop session router success skips the admin inbox',async t=>{
+ const b=desktopFixture(t,async()=>{throw Object.assign(new Error('owner unavailable'),{preDispatch:true});});
+ b.sessionRouter={forward:async()=>({delivered:true})};await b.tryStartTurn();
+ assert.equal(b.admin.length,0);assert.equal(b.pendingWake,false);
+});
+test('desktop session router failure ends in the admin inbox',async t=>{
+ const b=desktopFixture(t,async()=>{throw Object.assign(new Error('owner unavailable'),{preDispatch:true});});
+ b.sessionRouter={forward:async()=>({delivered:false,reason:'router send failed'})};await b.tryStartTurn();
+ assert.equal(b.admin.length,1);assert.equal(b.admin[0].stage,'session-router');assert.equal(b.admin[0].reason,'router send failed');
+});
+test('desktop uncertain outcome is terminal: admin inbox, no replay, journal cleared',async t=>{
+ const b=desktopFixture(t);b.client.request=async(m,p)=>{b.calls.push({method:m,params:p});throw new Error('Desktop thread-follower-start-turn timeout; outcome uncertain');};
+ await b.tryStartTurn();
+ assert.equal(b.calls.length,1);assert.equal(b.admin.length,1);assert.equal(b.admin[0].stage,'direct-uncertain');
+ assert.equal(b.admin[0].history[0].journal.state,'sending');assert.equal(fs.existsSync(b.deliveryFile),false);
+ assert.equal(b.acks.length,0);assert.equal(b.adminAcks.length,1);
+});
+test('admin inbox write failure keeps mail unread and propagates',async t=>{
+ const b=desktopFixture(t,async()=>{throw Object.assign(new Error('owner unavailable'),{preDispatch:true});});
+ b.adminInboxSend=()=>({status:1});
+ await assert.rejects(b.tryStartTurn(),/admin inbox persistence failed/);
+ assert.equal(b.adminAcks.length,0);assert.equal(b.pendingWake,true);
+});
+test('non-predispatch discovery error still propagates unchanged',async t=>{
+ const b=desktopFixture(t,async()=>{throw new Error('Unsupported Desktop state schema version');});
+ await assert.rejects(b.tryStartTurn(),/schema version/);assert.equal(b.admin.length,0);
+});

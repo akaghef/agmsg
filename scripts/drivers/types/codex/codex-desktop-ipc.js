@@ -178,8 +178,20 @@ class DesktopIpcClient {
 
   async refreshState(threadId) {
     this.threadId = threadId;
-    const response = await this.call("thread-owner-discovery", { hostId: "local", conversationId: threadId }, 1);
-    if (typeof response.handledByClientId !== "string" || !response.handledByClientId) throw new Error("Desktop conversation owner unavailable");
+    // Owner discovery precedes any turn submission. Its failure (an error such
+    // as no-client-found for a thread the Desktop has not loaded, a discovery
+    // timeout, or a missing owner) is a confirmed non-delivery: the next
+    // delivery path may take over without risking a duplicate turn.
+    let response;
+    try {
+      response = await this.call("thread-owner-discovery", { hostId: "local", conversationId: threadId }, 1);
+    } catch (error) {
+      throw Object.assign(new Error(`Desktop conversation owner unavailable: ${error.rpcError || error.message}`),
+        { preDispatch: true, rpcError: error.rpcError });
+    }
+    if (typeof response.handledByClientId !== "string" || !response.handledByClientId) {
+      throw Object.assign(new Error("Desktop conversation owner unavailable"), { preDispatch: true });
+    }
     this.ownerId = response.handledByClientId;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {

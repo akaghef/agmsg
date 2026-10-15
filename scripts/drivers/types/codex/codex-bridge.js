@@ -1411,6 +1411,39 @@ class CodexBridge {
     }
   }
 
+  // Terminal hand-off for mail that could not be delivered (protocol: delivery
+  // chain → agmsg Admin Inbox). The original rows, resolved target, reason and
+  // delivery history are written to agmsg-admin/inbox; only after that write
+  // succeeds are the original rows acknowledged as moved. No automatic retry.
+  // If the Admin Inbox write fails, mail stays unread and the error propagates.
+  moveToAdminInbox(batches, { reason, stage, record = null }) {
+    const payload = {
+      kind: "undeliverable",
+      reason: String(reason || "unknown"),
+      stage,
+      target: { team: this.identity?.team, role: this.identity?.name, thread: this.threadId },
+      messages: batches.flatMap((b) => b.rows.map((row) => ({ team: b.team, to: b.name, id: String(row.id),
+        at: row.at, from: row.from, body: row.body }))),
+      history: [{ at: new Date().toISOString(), path: "desktop-ipc", stage, outcome: reason,
+        ...(record ? { journal: { state: record.state, requestId: record.requestId,
+          clientUserMessageId: record.clientUserMessageId } } : {}) }],
+    };
+    const sent = (this.adminInboxSend || ((body) => spawnSync(BASH_BIN,
+      [path.join(SCRIPTS_DIR, "send.sh"), "agmsg-admin", "bridge", "inbox", body, "--force"],
+      { cwd: this.opts.project, encoding: "utf8" })))(JSON.stringify(payload));
+    if (sent.error || sent.status !== 0) throw new Error("admin inbox persistence failed; mail retained unread");
+    for (const batch of batches) {
+      const ids = batch.rows.map((r) => String(r.id));
+      const result = (this.adminInboxAck || ((b, list) => spawnSync(BASH_BIN,
+        [path.join(SCRIPTS_DIR, "inbox.sh"), b.team, b.name, "--ack", ...list],
+        { cwd: this.opts.project, encoding: "utf8" })))(batch, ids);
+      if (result.error || result.status !== 0) throw new Error("moved to admin inbox; acknowledgement pending");
+    }
+    if (record && fs.existsSync(this.deliveryFile)) fs.unlinkSync(this.deliveryFile);
+    console.error(`codex-bridge: moved ${payload.messages.length} message(s) for ${payload.target.team}/${payload.target.role} to agmsg-admin/inbox (${stage})`);
+    return payload;
+  }
+
   acknowledgeDelivery(record) {
     const allowed = this.eligiblePairs();
     if (record.threadId !== this.threadId) throw new Error("pending delivery belongs to a different thread");
@@ -1448,7 +1481,26 @@ class CodexBridge {
     this.assertBinding();
     this.recoverDelivery();
     if (this.opts.desktopIpc) {
-      const state = await this.client.refreshState(this.threadId);
+      let state;
+      try {
+        state = await this.client.refreshState(this.threadId);
+      } catch (error) {
+        if (!error.preDispatch) throw error;
+        // Confirmed non-delivery before any submission (e.g. the Desktop has
+        // not loaded the thread). Next path: the Session Router when one is
+        // configured; otherwise, or if it fails, the terminal Admin Inbox.
+        const pendingBatches = this.peekInbox();
+        if (pendingBatches.length) {
+          const routed = this.sessionRouter ? await this.sessionRouter.forward(pendingBatches, { thread: this.threadId }) : null;
+          if (!routed || !routed.delivered) {
+            this.moveToAdminInbox(pendingBatches, { stage: routed ? "session-router" : "direct-predispatch",
+              reason: routed ? routed.reason : error.message });
+          }
+        }
+        this.pendingWake = false;
+        await this.armWatch();
+        return;
+      }
       this.turnActive = state.active;
       this.threadIdle = !state.active;
       this.activeTurnId = state.turnId;
@@ -1497,6 +1549,14 @@ class CodexBridge {
       // Transport loss/timeout is ambiguous: leave the journal and unread rows,
       // and stop rather than risk delivering the same input twice.
       if (error.rpcRejected && record.state === "sending") fs.unlinkSync(this.deliveryFile);
+      // Desktop IPC with an unknown outcome is terminal: never try another
+      // path (double-execution risk); hand the mail to the Admin Inbox.
+      if (this.opts.desktopIpc && !error.rpcRejected && record.state === "sending") {
+        this.moveToAdminInbox(batches, { stage: "direct-uncertain", reason: error.message, record });
+        this.pendingWake = false;
+        await this.armWatch();
+        return;
+      }
       throw error;
     }
   }

@@ -152,15 +152,22 @@ test('Desktop explicit rejection leaves unread and removes only the sending jour
 for (const reply of ['timeout', 'closed', 'missing-turn', 'wrong-owner', 'wrong-owner-error', 'wrong-turn',
   'envelope-request-timeout', 'envelope-client-disconnected', 'envelope-server-closed',
   'envelope-App server request timed out', 'envelope-unknown native error']) {
-  test(`Desktop ${reply} leaves unread with correlation journal and refuses blind replay`, async t => {
+  test(`Desktop ${reply} moves mail to the terminal admin inbox with correlation and never replays`, async t => {
     const { bridge, requests } = await fixture(t, { active: true, reply });
-    await assert.rejects(bridge.tryStartTurn());
-    const record = JSON.parse(fs.readFileSync(bridge.deliveryFile));
-    assert.equal(record.state, 'sending'); assert.equal(record.transport, 'desktop-ipc');
-    assert.equal(record.requestId, requests.at(-1).requestId); assert.ok(record.clientUserMessageId);
-    assert.equal(bridge.acks.length, 0);
-    const previous = requests.length;
-    await assert.rejects(bridge.tryStartTurn(), /uncertain/); assert.equal(requests.length, previous);
+    const admin = []; let adminAcks = 0; const peek = bridge.peekInbox;
+    bridge.adminInboxSend = body => { admin.push(JSON.parse(body)); return { status: 0 }; };
+    bridge.adminInboxAck = () => { adminAcks++; return { status: 0 }; };
+    bridge.peekInbox = () => adminAcks ? [] : peek();
+    await bridge.tryStartTurn();
+    assert.equal(admin.length, 1); assert.equal(admin[0].stage, 'direct-uncertain');
+    const journal = admin[0].history[0].journal;
+    assert.equal(journal.state, 'sending'); assert.equal(admin[0].history[0].path, 'desktop-ipc');
+    assert.equal(journal.requestId, requests.at(-1).requestId); assert.ok(journal.clientUserMessageId);
+    assert.equal(adminAcks, 1); assert.equal(bridge.acks.length, 0);
+    assert.equal(fs.existsSync(bridge.deliveryFile), false);
+    const turns = () => requests.filter(r => /turn/.test(r.method || '')).length;
+    const previous = turns();
+    bridge.pendingWake = true; await bridge.tryStartTurn(); assert.equal(turns(), previous);
   });
 }
 
