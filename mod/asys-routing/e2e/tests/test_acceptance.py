@@ -66,6 +66,25 @@ class AcceptanceStoreTests(unittest.TestCase):
         self.assertEqual(len(result["unparsed_messages"]), 1)
         self.assertEqual(result["unparsed_messages"][0]["message_id"], "bad")
 
+    def test_turn_n_of_9_format_and_parent_control_traffic_pass(self):
+        self.rows = []
+        t = lambda n: (self.start + timedelta(seconds=n)).isoformat()
+        for i, child in enumerate(CHILDREN):
+            self.rows.append((f"r{i}", "demo", "parent", child, None, "message", "Rules: play しりとり, format TURN n/9: <word>. Reply READY.", t(0)))
+            self.rows.append((f"k{i}", "demo", child, "parent", None, "message", "READY", t(1)))
+        for n, word in enumerate(WORDS):
+            self.rows.append((f"m{n+1}", "demo", CHILDREN[n % 3], CHILDREN[(n + 1) % 3], None, "message", f"TURN {n+1}/9: {word}", t(10 + n * 2)))
+        self.rows.append(("done", "demo", "child-a", "parent", None, "message", "COMPLETE: 9/9 valid. Chain: " + " → ".join(WORDS), t(40)))
+        self._write()
+        result = self.judge()
+        self.assertEqual(result["status"], "pass", result["failure_reasons"])
+        self.assertEqual([m["move_no"] for m in result["moves"]], list(range(1, 10)))
+        self.assertEqual(len(result["parent_control_messages"]), 7)
+
+    def test_parent_relay_in_turn_format_still_fails(self):
+        row = list(self.rows[4]); row[2] = "parent"; row[6] = "TURN 5/9: " + WORDS[4]; self.rows[4] = tuple(row); self._write()
+        self.assertIn("parent_relayed_move", self.judge()["failure_reasons"])
+
     def test_saved_live_tsv_passes(self):
         fixture = Path(__file__).resolve().parents[1] / "fixtures/acceptance-live-20261014.tsv"
         fields = ("id", "message_id", "created_at", "team", "from_agent", "to_agent", "kind", "thread", "body")

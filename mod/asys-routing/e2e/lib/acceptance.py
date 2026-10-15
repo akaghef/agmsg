@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from judge import chain_endpoints, judge_transcript
 
 KANA_TOKEN = re.compile(r"(?<![ぁ-ゖァ-ヺー])([ぁ-ゖァ-ヺー]+)(?![ぁ-ゖァ-ヺー])")
-MOVE_PREFIX = re.compile(r"^(?:T(?P<tno>\d+)\s+|DONE\s+T(?P<done_no>\d+)\s+|move\s+(?P<mno>\d+)\s+)?", re.I)
+MOVE_PREFIX = re.compile(r"^(?:T(?P<tno>\d+)\s+|DONE\s+T(?P<done_no>\d+)\s+|move\s+(?P<mno>\d+)\s+|TURN\s+(?P<turn_no>\d+)(?:\s*/\s*\d+)?\s*:?\s*)?", re.I)
 
 
 def parse_move(body, order):
@@ -20,11 +20,21 @@ def parse_move(body, order):
         pass
     text = (body or "").strip()
     prefix = MOVE_PREFIX.match(text)
-    move_no = next((int(prefix.group(key)) for key in ("tno", "done_no", "mno") if prefix and prefix.group(key)), order)
+    move_no = next((int(prefix.group(key)) for key in ("tno", "done_no", "mno", "turn_no") if prefix and prefix.group(key)), order)
     remainder = text[prefix.end():] if prefix else text
     tokens = [token.strip("。、.!！?？「」『』()（）") for token in remainder.split()]
     tokens = [token for token in tokens if token]
     return (tokens[-1], move_no) if tokens and KANA_TOKEN.fullmatch(tokens[-1]) else (None, None)
+
+
+def has_explicit_move_no(body):
+    try:
+        value = json.loads(body)
+        if isinstance(value, dict): return isinstance(value.get("word"), str) and "move_no" in value
+    except (json.JSONDecodeError, TypeError):
+        pass
+    prefix = MOVE_PREFIX.match((body or "").strip())
+    return bool(prefix and any(prefix.group(k) for k in ("tno", "done_no", "mno", "turn_no")))
 
 
 def read_messages(team, since, stores):
@@ -49,11 +59,22 @@ def read_messages(team, since, stores):
 
 
 def judge_acceptance(messages, *, team, parent, since, prompt_level="P0", parent_reported_seconds=None, human_interventions=0):
-    errors, moves, unparsed, parent_move_messages = [], [], [], []
+    errors, moves, unparsed, parent_move_messages, control = [], [], [], [], []
     for order, row in enumerate(messages, 1):
         word, move_no = parse_move(row.get("body", ""), order)
+        if parent and row.get("to_agent") == parent and not has_explicit_move_no(row.get("body", "")):
+            # Messages to the parent without an explicit move number (READY, completion reports
+            # that list the chain) are control traffic. A numbered final move to the parent
+            # (e.g. "DONE T9 <word>") still counts as a move.
+            control.append({"message_id": row.get("message_id") or row.get("id"), "from_agent": row["from_agent"], "to_agent": row.get("to_agent"), "created_at": row["created_at"]})
+            continue
         if word is None:
             # Preserve candidate move-like traffic for audit; routine control messages are omitted.
+            # Unparsed traffic to or from the parent is setup/report (rules, START, completion),
+            # not a game move: a parent relay is still caught because relayed moves parse as moves.
+            if parent in (row.get("from_agent"), row.get("to_agent")):
+                control.append({"message_id": row.get("message_id") or row.get("id"), "from_agent": row["from_agent"], "to_agent": row.get("to_agent"), "created_at": row["created_at"]})
+                continue
             if re.search(r"しりとり|move|word|語|手番|\bT\d+\b|\bDONE\b", row.get("body", ""), re.I):
                 unparsed.append({"message_id": row.get("message_id") or row.get("id"), "from_agent": row["from_agent"], "created_at": row["created_at"], "body": row.get("body", "")})
             continue
@@ -98,5 +119,5 @@ def judge_acceptance(messages, *, team, parent, since, prompt_level="P0", parent
             errors.append("invalid_move_timestamp")
     if parent_reported_seconds is None: errors.append("parent_elapsed_time_not_reported")
     if prompt_level not in ("P0", "P1", "P2"): errors.append("invalid_prompt_level")
-    result = {"schema_version": 1, "tier": "acceptance", "team": team, "parent": parent, "since": since, "prompt_level": prompt_level, "human_interventions": human_interventions, "parent_reported_seconds": parent_reported_seconds, "judge_elapsed_seconds": elapsed, "child_senders": children, "child_sessions": {k: sorted(v) for k, v in sessions.items()}, "moves": moves, "unparsed_messages": unparsed, "parent_move_message_ids": parent_move_messages, "criteria": {"three_children": len(children) == 3, "nine_valid_moves": len(moves) == 9 and kana["criteria"]["rules_ok"], "round_robin": not any("move_order_violation" in e for e in errors), "no_parent_relay": not parent_move_messages, "parent_reported_elapsed": parent_reported_seconds is not None, "judge_elapsed_computed": elapsed is not None, "sessions_distinct": "children_must_have_distinct_sessions" not in errors, "unparsed_messages_clear": not unparsed}, "failure_reasons": errors, "status": "pass" if not errors else "fail"}
+    result = {"schema_version": 1, "tier": "acceptance", "team": team, "parent": parent, "since": since, "prompt_level": prompt_level, "human_interventions": human_interventions, "parent_reported_seconds": parent_reported_seconds, "judge_elapsed_seconds": elapsed, "child_senders": children, "child_sessions": {k: sorted(v) for k, v in sessions.items()}, "moves": moves, "unparsed_messages": unparsed, "parent_control_messages": control, "parent_move_message_ids": parent_move_messages, "criteria": {"three_children": len(children) == 3, "nine_valid_moves": len(moves) == 9 and kana["criteria"]["rules_ok"], "round_robin": not any("move_order_violation" in e for e in errors), "no_parent_relay": not parent_move_messages, "parent_reported_elapsed": parent_reported_seconds is not None, "judge_elapsed_computed": elapsed is not None, "sessions_distinct": "children_must_have_distinct_sessions" not in errors, "unparsed_messages_clear": not unparsed}, "failure_reasons": errors, "status": "pass" if not errors else "fail"}
     return result
