@@ -433,6 +433,12 @@ esac
   # actas flow knows the session is already named <team>-<agent> (name_arg) and
   # suppresses the "rename this session" tip meant for hand-started sessions.
   echo 'export AGMSG_SPAWNED=1'
+  # Run the CLI that this spawn resolved and validated above. The new pane gets
+  # the multiplexer's PATH (e.g. tmux's global environment), which can resolve
+  # the bare CLI name to a different, stale install than the spawner's.
+  if [ -n "$CLI_PATH" ]; then
+    printf 'export PATH=%q:"$PATH"\n' "$(dirname "$CLI_PATH")"
+  fi
   # Drop inherited same-type session-identity vars before exec'ing the CLI (#294).
   if [ -n "$SPAWN_UNSET_VARS" ]; then
     printf 'unset %s\n' "$SPAWN_UNSET_VARS"

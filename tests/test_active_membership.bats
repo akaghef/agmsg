@@ -175,3 +175,17 @@ unread() {
   [ "$status" -eq 143 ]
   [ ! -d "$guard" ]
 }
+@test "whoami: a role ACTIVE for another Codex thread is not this thread's identity" {
+  bash "$SCRIPTS/join.sh" team astra codex "$PROJ" >/dev/null; claim astra codex owner-thread
+  run env CODEX_THREAD_ID=owner-thread bash "$SCRIPTS/whoami.sh" "$PROJ" codex
+  [ "$status" -eq 0 ]; [[ "$output" == agent=astra* ]] || return 1
+  run env CODEX_THREAD_ID=new-thread bash "$SCRIPTS/whoami.sh" "$PROJ" codex
+  [ "$status" -eq 0 ]
+  [[ "$output" == not_joined=true\ held_by_other_session=astra* ]] || return 1
+  [[ "$output" != *agent=astra* ]] || return 1
+}
+@test "whoami: an unbound Codex registration is still offered to a new thread" {
+  bash "$SCRIPTS/join.sh" team idle codex "$PROJ" >/dev/null
+  run env CODEX_THREAD_ID=new-thread bash "$SCRIPTS/whoami.sh" "$PROJ" codex
+  [ "$status" -eq 0 ]; [[ "$output" == agent=idle* ]] || return 1
+}

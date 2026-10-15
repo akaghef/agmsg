@@ -67,6 +67,31 @@ fi
 # Format: each line "<team>\t<agent>".
 EXACT_MATCHES="$("$SCRIPT_DIR/identities.sh" "$PROJECT_PATH" "$AGENT_TYPE")"
 
+# A role that another live session of this type holds ACTIVE is that session's identity,
+# not a default for every session of that type in the same project. The type
+# manifest's session_env names the variable carrying the native session id. Without this, a new
+# thread (e.g. a spawned parent) resolved to the owner's name and sent as it.
+# Unbound registrations stay offered: claiming them is the explicit actas step.
+SESSION_ENV="$(agmsg_type_get "$AGENT_TYPE" session_env)"
+CURRENT_SESSION=""
+[ -z "$SESSION_ENV" ] || CURRENT_SESSION="${!SESSION_ENV:-}"
+if [ -n "$CURRENT_SESSION" ] && [ -n "$EXACT_MATCHES" ]; then
+  source "$SCRIPT_DIR/lib/role-session.sh"
+  HELD_ELSEWHERE=""
+  KEPT=""
+  while IFS=$'\t' read -r _team _agent; do
+    [ -n "$_team" ] && [ -n "$_agent" ] || continue
+    agmsg_role_active_load "$_team" "$_agent"
+    if [ -n "$AGMSG_ROLE_ACTIVE_SESSION" ] && [ "$AGMSG_ROLE_ACTIVE_SESSION" != "$CURRENT_SESSION" ]; then
+      HELD_ELSEWHERE="${HELD_ELSEWHERE:+$HELD_ELSEWHERE,}$_agent"
+    else
+      KEPT="${KEPT:+$KEPT
+}$_team	$_agent"
+    fi
+  done <<< "$EXACT_MATCHES"
+  EXACT_MATCHES="$KEPT"
+fi
+
 # Suggestions = any agents of this type registered elsewhere, plus the list
 # of all teams on disk. These still need a full scan since identities.sh is
 # scoped to the exact (project, type).
@@ -106,6 +131,13 @@ for config_file in "$TEAMS_DIR"/*/config.json; do
     WHERE json_extract(r.value, '\$.type') = '$AGENT_TYPE_SQL';
   " | tr -d '\r')
 done
+
+# Every exact role is held by another session: report it as not joined so the
+# session picks its own name, instead of suggesting the held name for reuse.
+if [ -z "$EXACT_MATCHES" ] && [ -n "${HELD_ELSEWHERE:-}" ]; then
+  echo "not_joined=true held_by_other_session=$HELD_ELSEWHERE available_teams=${ALL_TEAMS:-none}"
+  exit 0
+fi
 
 if [ -z "$EXACT_MATCHES" ] && [ -z "$SUGGESTED_MATCHES" ]; then
   echo "not_joined=true available_teams=${ALL_TEAMS:-none}"

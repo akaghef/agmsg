@@ -187,6 +187,17 @@ teardown() {
   [[ "$output" == *"export AGMSG_SPAWNED=1"* ]]
 }
 
+@test "spawn: boot script pins PATH to the CLI the spawner resolved" {
+  bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+  run bash "$SCRIPTS/spawn.sh" claude-code alice --project "$PROJ" --no-wait
+  [ "$status" -eq 0 ]
+  local resolved; resolved="$(dirname "$(command -v claude)")"
+  boot="$(cat "$CAPTURE")"; run cat "$boot"
+  # The pane inherits the multiplexer's PATH; the boot script must put the
+  # directory of the validated CLI first so the same binary is launched.
+  [[ "$output" == *"export PATH=$(printf %q "$resolved"):"* ]]
+}
+
 @test "spawn: a type without name_arg emits no name flag (#339)" {
   # gemini's manifest has no name_arg=, so the boot script must not name the
   # session -- no bare `-n` token, unchanged from pre-#339 behavior.
