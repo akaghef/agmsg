@@ -42,7 +42,9 @@ class Routing(unittest.TestCase):
         bridge=pathlib.Path(os.environ["AGMSG_BRIDGE_ROOT"]); legacy_inbox=bridge/"pending/windows_to_mac"; legacy_inbox.mkdir(parents=True,exist_ok=True)
         seeded_packet={"schema":"agmsg.message.v2","id":"installed-layout-seed","team":"a-sys","from":"windows/worker","to":"secretary","kind":"message","thread":"","body":"installed fixture"}
         (legacy_inbox/"installed-layout-seed.json").write_text(json.dumps(seeded_packet))
-        claude=base/"claude/settings.json"; claude.parent.mkdir(); claude.write_text(json.dumps({"preserved":True,"hooks":{"SessionStart":[]}}))
+        stale={"matcher":"","hooks":[{"type":"command","command":str(live/"scripts/agmsg-routing/hooks/session-start.sh")+" --runtime claude-code","timeout":5}]}
+        other={"matcher":"","hooks":[{"type":"command","command":"other-hook"}]}
+        claude=base/"claude/settings.json"; claude.parent.mkdir(); claude.write_text(json.dumps({"preserved":True,"hooks":{"SessionStart":[stale,other,stale]}}))
         codex=base/"codex/hooks.json"; codex.parent.mkdir(); codex.write_text(json.dumps({"preserved":True,"hooks":{"SessionStart":[]}}))
         env=os.environ.copy(); env.update({"HOME":str(home),"AGMSG_LIVE_ROOT":str(live),"CLAUDE_SETTINGS":str(claude),"CODEX_HOOKS":str(codex)})
         p=subprocess.run(["bash",str(ROOT/"install.sh")],text=True,capture_output=True,env=env)
@@ -58,8 +60,9 @@ class Routing(unittest.TestCase):
         for file, runtime in ((claude,"claude-code"),(codex,"codex")):
             data=json.loads(file.read_text()); self.assertTrue(data["preserved"])
             entries=data["hooks"]["SessionStart"]
-            hook=next(h for e in entries for h in e["hooks"] if runtime in h["command"])
-            self.assertEqual(hook["timeout"],10)
+            routing=[h for e in entries for h in e["hooks"] if "agmsg-routing/hooks/session-start.sh" in h["command"]]
+            self.assertEqual(len(routing),1); self.assertIn(runtime,routing[0]["command"]); self.assertEqual(routing[0]["timeout"],10)
+        self.assertIn("other-hook",claude.read_text())
         hook_script=live/"scripts/agmsg-routing/hooks/session-start.sh"; cwd=base/"unmapped"; cwd.mkdir()
         hook_env=env.copy(); hook_env.pop("AGMSG_AGENT_ID",None); hook_env["AGMSG_BRIDGE_ROOT"]=str(pathlib.Path(os.environ["AGMSG_BRIDGE_ROOT"])); hook_env["AGMSG_STATE_DIR"]=str(pathlib.Path(os.environ["AGMSG_STATE_DIR"]))
         presence_file=bridge/"presence/mac.json"

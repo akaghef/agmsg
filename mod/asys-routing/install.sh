@@ -51,12 +51,21 @@ def update(path,runtime,kind):
  hooks=data.setdefault('hooks',{})
  arr=hooks.setdefault('SessionStart',[])
  command=hook+' --runtime '+runtime
- marker='agmsg-routing/session-start.sh'
+ marker='agmsg-routing/hooks/session-start.sh'
  matched=False
+ # Update the first routing hook in place and drop repeats left by earlier installs.
+ emptied=[]
  for item in arr:
-  for entry in item.get('hooks',[]):
+  if 'hooks' not in item: continue
+  kept=[]
+  for entry in item['hooks']:
    if marker in entry.get('command',''):
+    if matched: continue
     entry.update({'command':command,'timeout':10}); matched=True
+   kept.append(entry)
+  if item['hooks'] and not kept: emptied.append(item)
+  item['hooks']=kept
+ arr[:]=[item for item in arr if all(item is not e for e in emptied)]
  if not matched:
   item={'hooks':[{'type':'command','command':command,'timeout':10}]}
   if kind=='claude': item['matcher']=''
