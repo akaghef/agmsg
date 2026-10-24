@@ -88,8 +88,10 @@ def cmd_watcher(seed=False):
 
 def presence(agents,teams,runtime):
     d=ROOT/"presence"; d.mkdir(parents=True,exist_ok=True)
-    data={"device":"mac","agents":[x for x in agents.split(",") if x],"runtime":runtime,"teams":[TEAMS.get(x,x) for x in teams.split(",") if x],"heartbeat_utc":dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")}
-    (d/"mac.json").write_text(json.dumps(data,indent=2)+"\n")
+    uniq=lambda xs: list(dict.fromkeys(x for x in xs if x))
+    data={"device":"mac","agents":uniq(agents.split(",")),"runtime":",".join(uniq(runtime.split(","))),"teams":uniq(TEAMS.get(x,x) for x in teams.split(",")),"heartbeat_utc":dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")}
+    # Peers read this file through Syncthing; replace it atomically.
+    tmp=d/f".mac.json.{os.getpid()}.tmp"; tmp.write_text(json.dumps(data,indent=2)+"\n"); os.replace(tmp,d/"mac.json")
 
 def directory():
     now=dt.datetime.now(dt.timezone.utc)

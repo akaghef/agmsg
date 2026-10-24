@@ -40,8 +40,10 @@ PAIRS="$(agmsg_subscription_pairs "$PROJECT" "$RUNTIME" "$OWNER" 2>/dev/null)"
 while IFS=$'\t' read -r team agent; do
   [[ -n "$team" && -n "$agent" ]] || continue
   agmsg_role_active_matches "$team" "$agent" "$RUNTIME" "$SESSION" "$(agmsg_canonical_path "$PROJECT")" "$OWNER" || continue
-  AGMSG_BRIDGE_ROOT="$ROOT" "$ROUTE" presence write "$agent" "$team" "$RUNTIME" >/dev/null 2>&1
+  JOINED=1
   echo "agmsg SessionStart team=$team role=$agent"
   "$ROUTE" unread-summary "$team" "$agent" 2>/dev/null | head -20
 done <<< "$PAIRS"
+# Same device heartbeat as the watcher, so a join shows up before its next tick.
+[[ -z "${JOINED:-}" ]] || AGMSG_BRIDGE_ROOT="$ROOT" "$BASE/presence.sh" >/dev/null 2>&1
 exit 0

@@ -17,6 +17,11 @@ the existing A-sys routing installer. The entry point backs up code and records
 the source commit. The upstream updater preserves DB/team contents; it may
 correct old team-config permissions, using its existing migration behavior.
 The routing installer merges its existing hooks and seeds its existing watcher.
+The watcher (launchd, every 30 s) also rewrites the device heartbeat
+`Akaghef-Bridge/presence/mac.json` atomically through `presence.sh`: `agents`
+lists only roles whose explicit membership is held by a live session, so an
+empty list with a fresh `heartbeat_utc` still means the device is online. The
+SessionStart hook runs the same writer after a join.
 Do not symlink the entire installation to the
 fork: upstream storage defaults are relative to the installed script paths.
 

@@ -98,5 +98,22 @@ class Routing(unittest.TestCase):
         self.assertEqual(data["agents"],[]); self.assertEqual(data["runtime"],"codex")
         (bridge/"presence/mac.json").write_text(json.dumps(data))
         self.assertIn("absent",run("directory").stdout)
+    def test_watcher_refreshes_presence_with_live_roles_only(self):
+        bridge=pathlib.Path(os.environ["AGMSG_BRIDGE_ROOT"]); skill=bridge.parent/"skill"; rundir=skill/"run"; rundir.mkdir(parents=True)
+        (skill/"scripts").mkdir(); (skill/"scripts/lib").symlink_to(ROOT.parents[1]/"scripts/lib")
+        exited=subprocess.Popen(["true"]); exited.wait()
+        roles={("a-sys","director","claude-code",f"live-sid.{os.getpid()}"),("a-sys","worker","claude-code",f"dead-sid.{exited.pid}"),("m3e","director","claude-code",f"live-sid.{os.getpid()}")}
+        for team,agent,runtime,owner in roles:
+            (rundir/f"actas.{team}__{agent}.session").write_text(owner+"\n")
+            (rundir/f"role-active.{team}__{agent}").write_text(f"session=s\nowner={owner}\nproject=/p\ntype={runtime}\nteam={team}\nagent={agent}\n")
+        env=os.environ.copy(); env["AGMSG_SKILL_DIR"]=str(skill)
+        p=subprocess.run(["bash",str(ROOT/"watcher.sh")],text=True,capture_output=True,env=env)
+        self.assertEqual(p.returncode,0,p.stderr); self.assertIn("created=",p.stdout)
+        data=json.loads((bridge/"presence/mac.json").read_text())
+        self.assertEqual(data["device"],"mac"); self.assertEqual(data["agents"],["director"])
+        self.assertEqual(sorted(data["teams"]),["a-sys","m3e"]); self.assertEqual(data["runtime"],"claude-code")
+        self.assertRegex(data["heartbeat_utc"],r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual([f.name for f in (bridge/"presence").iterdir()],["mac.json"])
+        self.assertIn("present",run("directory").stdout)
 
 if __name__ == "__main__": unittest.main(verbosity=2)

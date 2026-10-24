@@ -37,8 +37,9 @@ for dep in lib internal drivers; do
 done
 ln -sfn "../../teams" "$LIVE/scripts/agmsg-routing/teams"
 cp "$HERE/watcher.sh" "$LIVE/scripts/agmsg-routing/watcher.sh"
+cp "$HERE/presence.sh" "$LIVE/scripts/agmsg-routing/presence.sh"
 cp "$HERE/hooks/session-start.sh" "$LIVE/scripts/agmsg-routing/hooks/session-start.sh"
-chmod +x "$LIVE/scripts/agmsg-routing/watcher.sh" "$LIVE/scripts/agmsg-routing/hooks/session-start.sh"
+chmod +x "$LIVE/scripts/agmsg-routing/watcher.sh" "$LIVE/scripts/agmsg-routing/presence.sh" "$LIVE/scripts/agmsg-routing/hooks/session-start.sh"
 cp "$HERE/team-map.yaml" "$LIVE/scripts/agmsg-routing/team-map.yaml"
 sed "s#/Users/akaghef/.agents/skills/agmsg/scripts/agmsg-routing/watcher.sh#$LIVE/scripts/agmsg-routing/watcher.sh#" "$HERE/org.akaghef.agmsg-bridge-watcher.plist" > "$PLIST"
 python3 - "$CLAUDE" "$CODEX" "$LIVE/scripts/agmsg-routing/hooks/session-start.sh" <<'PY'
